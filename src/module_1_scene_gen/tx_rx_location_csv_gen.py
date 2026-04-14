@@ -61,7 +61,7 @@ def main(cfg: DictConfig):
     tx_positions = np.stack([rand_x, rand_y, rand_z], axis=1)
 
     # Setup Output Path
-    output_dir = os.path.join(project_dir, "data", "gps_coordinates")
+    output_dir = os.path.join(project_dir, "configs", "gps_coordinates")
     os.makedirs(output_dir, exist_ok=True)
     csv_filename = os.path.join(output_dir, f"{loc_id}_tx_rx.csv")
 
@@ -98,7 +98,7 @@ def main(cfg: DictConfig):
             'look_at_z': f"{rx_look[2]:.3f}"
         })
 
-    print(f"Success :)! Generated layout with RX saved to: {csv_filename}")
+    print(f"SUCCESS! Generated layout with RX saved to: {csv_filename}")
 
 if __name__ == "__main__":
     main()
