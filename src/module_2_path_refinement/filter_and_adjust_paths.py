@@ -183,13 +183,13 @@ def main(cfg: DictConfig):
     project_dir = cfg.project_dir
 
     # ---- Array geometry from config ----
-    M = int(cfg.rx_array.num_rows)
-    N = int(cfg.rx_array.num_cols)
-    d_h_wl = float(cfg.rx_array.get("horizontal_spacing", 0.5))
-    d_v_wl = float(cfg.rx_array.get("vertical_spacing", 0.5))
+    M = int(cfg.rx_array_geometry.num_rows)
+    N = int(cfg.rx_array_geometry.num_cols)
+    d_h_wl = float(cfg.rx_array_geometry.get("horizontal_spacing", 0.5))
+    d_v_wl = float(cfg.rx_array_geometry.get("vertical_spacing", 0.5))
 
-    fov_az_deg = float(cfg.rx_array.fov_az_deg)
-    fov_el_deg = float(cfg.rx_array.fov_el_deg)
+    fov_az_deg = float(cfg.rx_array_geometry.fov_az_deg)
+    fov_el_deg = float(cfg.rx_array_geometry.fov_el_deg)
     fov_az_rad = np.radians(fov_az_deg)
     fov_el_rad = np.radians(fov_el_deg)
 

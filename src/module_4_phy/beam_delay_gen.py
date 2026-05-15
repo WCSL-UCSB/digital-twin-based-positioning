@@ -6,6 +6,16 @@
 # produces complex beam-delay profiles (BDPs) per link plus a single
 # consolidated training dataset.
 #
+# Multi-BS support:
+#   When num_rx > 1, the output dataset groups BDPs by TX position and
+#   stacks them along a new BS-channel axis:
+#     ULA: Z shape = (num_positions, N_beams, Lh, K)
+#     UPA: Z shape = (num_positions, M, N_beams, Lh, K)
+#   When num_rx == 1 (single-BS), the output is unchanged:
+#     ULA: Z shape = (num_positions, N_beams, Lh)
+#     UPA: Z shape = (num_positions, M, N_beams, Lh)
+#   Zero-padding is applied when a BS has no surviving paths to a position.
+#
 # Pipeline per link:
 #   1. Cyclic-prefixed Zadoff-Chu pilot is transmitted through each element.
 #   2. Beamspace DFT across N columns (azimuth) and, if M > 1, M rows (elev).
@@ -20,10 +30,6 @@
 # Filtering policy: only "link has at least one surviving path." All other
 # per-sample metadata (is_los_kept, shift_ns, snr_*, p_rx_total_dbm) is
 # carried through so downstream code can mask or weight without regenerating.
-#
-# Note on pulse shape stacking: channel_tap_gen.py samples paths through a
-# sinc pulse; this script applies a ZC pilot on top. See tracker T14 for
-# the sanity check that this stacking is negligible for current parameters.
 # =============================================================================
 
 import os
@@ -120,8 +126,7 @@ def bdp_from_H(H, s_cp, S_conj, Lh, Lcp, Nseq):
 def _complex_to_display_log(Z, display_range_db=50.0):
     """
     Convert complex BDP to a normalized [0, 1] log-magnitude image FOR
-    DISPLAY ONLY. Not saved to disk. Training-time code should implement
-    its own preprocessing on the complex data.
+    DISPLAY ONLY. Not saved to disk.
     """
     mag = np.abs(Z)
     peak = mag.max() + 1e-12
@@ -153,34 +158,64 @@ def get_latest_calibrated_npz(path_dir, scenario_name):
 
 
 # ---------------------------------------------------------------------------
-# Sanity plot (converts to display log on the fly)
+# Sanity plot
 # ---------------------------------------------------------------------------
 
-def save_sanity_plot(Z_all, indices, titles, out_path, M, N,
+def save_sanity_plot(Z_samples, titles, out_path, M, N, K,
                      display_range_db=50.0):
-    """Grid plot of up to 9 BDPs with labels. Log conversion is display-only."""
-    n = len(indices)
+    """
+    Grid plot of BDPs with labels. For multi-BS, shows one row per sample
+    with columns for each BS.
+    """
+    n = len(Z_samples)
     if n == 0:
         return
-    cols = 3
-    rows = int(np.ceil(n / cols))
 
-    fig, axes = plt.subplots(rows, cols, figsize=(4*cols, 3*rows))
-    axes = np.atleast_2d(axes).ravel()
+    if K > 1:
+        # Multi-BS: one row per sample, one column per BS
+        rows = min(n, 4)
+        cols = K
+        fig, axes = plt.subplots(rows, cols, figsize=(4*cols, 3*rows))
+        axes = np.atleast_2d(axes)
 
-    for ax, idx, title in zip(axes, indices, titles):
-        Z = Z_all[idx]
-        img = _complex_to_display_log(Z, display_range_db)
-        if img.ndim == 3:  # UPA: take peak elevation beam
-            peak_el = int(np.argmax(img.max(axis=(1, 2))))
-            img = img[peak_el]
-        ax.imshow(img, aspect="auto", origin="lower", cmap="inferno",
-                  vmin=0, vmax=1)
-        ax.set_title(title, fontsize=9)
-        ax.set_xlabel("Delay bin")
-        ax.set_ylabel("Az beam")
-    for ax in axes[n:]:
-        ax.axis("off")
+        for row in range(rows):
+            Z = Z_samples[row]  # (..., Lh, K) or (M, ..., Lh, K)
+            for k in range(K):
+                ax = axes[row, k]
+                if M > 1:
+                    Z_k = Z[:, :, :, k]  # (M, N, Lh)
+                else:
+                    Z_k = Z[:, :, k]     # (N, Lh)
+                img = _complex_to_display_log(Z_k, display_range_db)
+                if img.ndim == 3:
+                    peak_el = int(np.argmax(img.max(axis=(1, 2))))
+                    img = img[peak_el]
+                ax.imshow(img, aspect="auto", origin="lower", cmap="inferno",
+                          vmin=0, vmax=1)
+                if row == 0:
+                    ax.set_title(f"BS {k}", fontsize=9)
+                if k == 0:
+                    ax.set_ylabel(titles[row], fontsize=8)
+                ax.set_xlabel("Delay bin")
+    else:
+        # Single-BS: original layout
+        cols = 3
+        rows = int(np.ceil(n / cols))
+        fig, axes = plt.subplots(rows, cols, figsize=(4*cols, 3*rows))
+        axes = np.atleast_2d(axes).ravel()
+
+        for ax, Z, title in zip(axes, Z_samples, titles):
+            img = _complex_to_display_log(Z, display_range_db)
+            if img.ndim == 3:
+                peak_el = int(np.argmax(img.max(axis=(1, 2))))
+                img = img[peak_el]
+            ax.imshow(img, aspect="auto", origin="lower", cmap="inferno",
+                      vmin=0, vmax=1)
+            ax.set_title(title, fontsize=9)
+            ax.set_xlabel("Delay bin")
+            ax.set_ylabel("Az beam")
+        for ax in axes[n:]:
+            ax.axis("off")
 
     plt.suptitle(f"Display log range: {display_range_db:.0f} dB "
                  f"(for visualization only)", fontsize=8, y=1.02)
@@ -215,6 +250,7 @@ def main(cfg: DictConfig):
     rx_names    = ch_data["rx_names"]
 
     num_rx, num_tx, M, N, T_fixed = H_all.shape
+    K = num_rx  # number of base stations
 
     # ---- Optional SNR pass-through ----
     calib_dir = os.path.join(project_dir, "data", "path_data", "calibrated_paths")
@@ -222,10 +258,10 @@ def main(cfg: DictConfig):
     if calib_file is not None:
         print(f"Loading SNR from: {os.path.basename(calib_file)}")
         calib_data = np.load(calib_file, allow_pickle=True)
-        snr_raw_db      = calib_data["snr_raw_db"]
-        snr_bf_db       = calib_data["snr_bf_db"]
-        snr_detector_db = calib_data["snr_detector_db"]
-        p_rx_total_dbm  = calib_data["p_rx_total_dbm"]
+        snr_raw_db      = calib_data["snr_raw_db"]       # (R, T)
+        snr_bf_db       = calib_data["snr_bf_db"]         # (R, T)
+        snr_detector_db = calib_data["snr_detector_db"]   # (R, T)
+        p_rx_total_dbm  = calib_data["p_rx_total_dbm"]    # (R, T)
         has_snr = True
     else:
         print("[Info] No calibrated .npz found; SNR fields will be absent.")
@@ -252,43 +288,34 @@ def main(cfg: DictConfig):
     if label_dim not in (2, 3):
         raise ValueError(f"label_dim must be 2 or 3, got {label_dim}")
 
-    # ---- Process mask: only "link has any paths" ----
-    process_mask = num_paths > 0
-    n_process = int(process_mask.sum())
-
     # ---- Summary ----
     array_type = "UPA" if M > 1 else "ULA"
+    multi_bs = K > 1
     print(f"\n--- BDP Generation ({array_type}) ---")
     print(f"Array        : {M} x {N} = {M*N} elements")
+    print(f"Base stations: {K}  {'(multi-BS)' if multi_bs else '(single-BS)'}")
     print(f"Pilot        : {seq_type} length={Nseq} root={root}")
     print(f"Delay bins   : Lh={Lh}, CP={Lcp}")
-    print(f"Total links  : {num_rx*num_tx}")
-    print(f"Processing   : {n_process} links with surviving paths")
-    print(f"  LoS-kept   : {int((is_los_kept & process_mask).sum())}")
-    print(f"  NLoS-only  : {int((~is_los_kept & process_mask).sum())}")
+    print(f"Total links  : {num_rx * num_tx}")
     print(f"Label dim    : {label_dim}D")
     print(f"Output dtype : complex64 (log conversion deferred to training)")
 
-    # ---- Allocate output (complex, canonical) ----
-    Z_shape = (n_process, M, N, Lh) if M > 1 else (n_process, N, Lh)
-    Z_all = np.zeros(Z_shape, dtype=np.complex64)
-    Y_all = np.zeros((n_process, label_dim), dtype=np.float32)
+    # ================================================================
+    #  PHASE 1: Generate per-link BDPs into a (R, T, ...) tensor
+    # ================================================================
+    # Single BDP shape (after M==1 squeeze): (N, Lh)  or (M, N, Lh) for UPA
+    bdp_shape_single = (N, Lh) if M == 1 else (M, N, Lh)
 
-    link_rx_idx  = np.zeros(n_process, dtype=np.int32)
-    link_tx_idx  = np.zeros(n_process, dtype=np.int32)
-    is_los_out   = np.zeros(n_process, dtype=bool)
-    shift_ns_out = np.zeros(n_process, dtype=np.float32)
-    snr_raw_out  = np.zeros(n_process, dtype=np.float32) if has_snr else None
-    snr_bf_out   = np.zeros(n_process, dtype=np.float32) if has_snr else None
-    snr_det_out  = np.zeros(n_process, dtype=np.float32) if has_snr else None
-    p_rx_out     = np.zeros(n_process, dtype=np.float32) if has_snr else None
+    # Full per-link BDP tensor
+    Z_per_link = np.zeros((num_rx, num_tx) + bdp_shape_single,
+                          dtype=np.complex64)
 
-    # ---- Process ----
+    n_generated = 0
     t0 = time.time()
-    out_idx = 0
+
     for r in range(num_rx):
         for t in range(num_tx):
-            if not process_mask[r, t]:
+            if num_paths[r, t] == 0:
                 continue
 
             H = H_all[r, t].astype(np.complex128)
@@ -296,37 +323,134 @@ def main(cfg: DictConfig):
             if M == 1:
                 Z = Z[0]  # (N, Lh)
 
-            Z_all[out_idx] = Z.astype(np.complex64)
-            Y_all[out_idx] = tx_pos[t, :label_dim]
-            link_rx_idx[out_idx]  = r
-            link_tx_idx[out_idx]  = t
-            is_los_out[out_idx]   = bool(is_los_kept[r, t])
-            shift_ns_out[out_idx] = float(shift_ns[r, t])
+            Z_per_link[r, t] = Z.astype(np.complex64)
+            n_generated += 1
 
-            if has_snr:
-                snr_raw_out[out_idx] = float(snr_raw_db[r, t])
-                snr_bf_out[out_idx]  = float(snr_bf_db[r, t])
-                snr_det_out[out_idx] = float(snr_detector_db[r, t])
-                p_rx_out[out_idx]    = float(p_rx_total_dbm[r, t])
-
-            out_idx += 1
-            if out_idx % 500 == 0:
-                rate = out_idx / max(time.time() - t0, 1e-6)
-                print(f"  {out_idx}/{n_process}  ({rate:.1f} links/s)")
+            if n_generated % 500 == 0:
+                rate = n_generated / max(time.time() - t0, 1e-6)
+                print(f"  {n_generated} links processed  ({rate:.1f} links/s)")
 
     elapsed = time.time() - t0
-    print(f"\nProcessed {out_idx} links in {elapsed:.1f}s "
-          f"({out_idx/max(elapsed,1e-6):.1f} links/s)")
+    print(f"\nPhase 1 complete: {n_generated} links in {elapsed:.1f}s")
+
+    # ================================================================
+    #  PHASE 2: Assemble dataset grouped by TX position
+    # ================================================================
+    # For each TX position, we need at least one BS to have paths.
+    # has_any_bs[t] = True if any BS sees this TX
+    has_any_bs = np.any(num_paths > 0, axis=0)  # (T,) bool
+    n_positions = int(has_any_bs.sum())
+
+    # Coverage statistics per BS
+    print(f"\n--- Multi-BS Coverage ---")
+    for r in range(K):
+        bs_coverage = int((num_paths[r] > 0).sum())
+        print(f"  {rx_names[r]:12s}: {bs_coverage}/{num_tx} positions "
+              f"({100*bs_coverage/num_tx:.1f}%)")
+    print(f"  Union (any BS) : {n_positions}/{num_tx} positions "
+          f"({100*n_positions/num_tx:.1f}%)")
+
+    if multi_bs:
+        # Count zero-padded positions per BS
+        for r in range(K):
+            n_zeropad = int(has_any_bs.sum() - (num_paths[r] > 0).sum())
+            print(f"  {rx_names[r]:12s}: {n_zeropad} positions will be zero-padded")
+
+    # Allocate output arrays
+    if multi_bs:
+        # Stack K BS channels along the last axis
+        # ULA: (n_positions, N, Lh, K)
+        # UPA: (n_positions, M, N, Lh, K)
+        Z_shape = (n_positions,) + bdp_shape_single + (K,)
+    else:
+        # Single-BS: no extra axis
+        # ULA: (n_positions, N, Lh)
+        # UPA: (n_positions, M, N, Lh)
+        Z_shape = (n_positions,) + bdp_shape_single
+
+    Z_all = np.zeros(Z_shape, dtype=np.complex64)
+    Y_all = np.zeros((n_positions, label_dim), dtype=np.float32)
+
+    # Per-sample metadata: per-BS info stored as (n_positions, K) or scalar
+    is_los_out   = np.zeros((n_positions, K), dtype=bool)
+    shift_ns_out = np.zeros((n_positions, K), dtype=np.float32)
+    has_paths_out = np.zeros((n_positions, K), dtype=bool)
+
+    if has_snr:
+        snr_raw_out = np.zeros((n_positions, K), dtype=np.float32)
+        snr_bf_out  = np.zeros((n_positions, K), dtype=np.float32)
+        snr_det_out = np.zeros((n_positions, K), dtype=np.float32)
+        p_rx_out    = np.zeros((n_positions, K), dtype=np.float32)
+    else:
+        snr_raw_out = snr_bf_out = snr_det_out = p_rx_out = None
+
+    # TX indices that made it into the dataset (for reference)
+    tx_idx_out = np.zeros(n_positions, dtype=np.int32)
+
+    out_idx = 0
+    valid_tx_indices = np.where(has_any_bs)[0]
+
+    for t in valid_tx_indices:
+        Y_all[out_idx] = tx_pos[t, :label_dim]
+        tx_idx_out[out_idx] = t
+
+        for r in range(K):
+            has = num_paths[r, t] > 0
+            has_paths_out[out_idx, r] = has
+            is_los_out[out_idx, r]    = bool(is_los_kept[r, t])
+            shift_ns_out[out_idx, r]  = float(shift_ns[r, t])
+
+            if has_snr:
+                snr_raw_out[out_idx, r] = float(snr_raw_db[r, t])
+                snr_bf_out[out_idx, r]  = float(snr_bf_db[r, t])
+                snr_det_out[out_idx, r] = float(snr_detector_db[r, t])
+                p_rx_out[out_idx, r]    = float(p_rx_total_dbm[r, t])
+
+            if has:
+                bdp = Z_per_link[r, t]  # (N, Lh) or (M, N, Lh)
+            else:
+                # Zero-pad: this BS doesn't see this position
+                bdp = np.zeros(bdp_shape_single, dtype=np.complex64)
+
+            if multi_bs:
+                # Place into the K-th channel slot
+                Z_all[out_idx][..., r] = bdp
+            else:
+                Z_all[out_idx] = bdp
+
+        out_idx += 1
+
+    assert out_idx == n_positions
 
     print(f"\nDataset shapes:")
     print(f"  Z: {Z_all.shape}  dtype={Z_all.dtype}")
     print(f"  Y: {Y_all.shape}  dtype={Y_all.dtype}")
+    if multi_bs:
+        print(f"  Z axes: (num_positions, "
+              + ("M, " if M > 1 else "")
+              + f"N_beams={N}, Lh={Lh}, K={K})")
+    else:
+        print(f"  Z axes: (num_positions, "
+              + ("M, " if M > 1 else "")
+              + f"N_beams={N}, Lh={Lh})")
 
     # ---- Save ----
     out_dir = os.path.join(project_dir, "data", "ml_datasets", cfg.scenario_name)
     os.makedirs(out_dir, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     ds_file = os.path.join(out_dir, f"{stamp}_bdp_dataset_{cfg.scenario_name}.npz")
+
+    # Z axes description
+    if multi_bs:
+        z_axes_str = (
+            f"(num_positions, M, N_beams, Lh, K={K})" if M > 1
+            else f"(num_positions, N_beams, Lh, K={K})"
+        )
+    else:
+        z_axes_str = (
+            "(num_positions, M, N_beams, Lh)" if M > 1
+            else "(num_positions, N_beams, Lh)"
+        )
 
     dataset_meta = {
         "source_channels_npz":   os.path.basename(ch_file),
@@ -339,21 +463,27 @@ def main(cfg: DictConfig):
             "Lh":     Lh,
             "Lcp":    Lcp,
         },
-        "label_dim":     label_dim,
-        "array":         {"M": M, "N": N},
-        "num_samples":   int(out_idx),
-        "num_los_kept":  int(is_los_out.sum()),
-        "num_nlos_only": int((~is_los_out).sum()),
-        "Z_dtype":       "complex64",
-        "Z_axes": (
-            "(num_samples, M, N_beams, Lh)" if M > 1
-            else "(num_samples, N_beams, Lh)"
-        ),
+        "label_dim":        label_dim,
+        "array":            {"M": M, "N": N},
+        "num_base_stations": K,
+        "bs_names":         list(rx_names),
+        "num_positions":    int(n_positions),
+        "multi_bs":         multi_bs,
+        "num_los_kept":     {str(rx_names[r]): int((is_los_out[:, r] &
+                             has_paths_out[:, r]).sum()) for r in range(K)},
+        "num_nlos_only":    {str(rx_names[r]): int((~is_los_out[:, r] &
+                             has_paths_out[:, r]).sum()) for r in range(K)},
+        "coverage":         {str(rx_names[r]): int(has_paths_out[:, r].sum())
+                             for r in range(K)},
+        "zero_padded":      {str(rx_names[r]): int((~has_paths_out[:, r]).sum())
+                             for r in range(K)},
+        "Z_dtype":          "complex64",
+        "Z_axes":           z_axes_str,
         "filtering_note": (
-            "Only 'link has surviving paths' filter applied. No SNR, "
-            "delay, or LoS-based gating. Per-sample metadata is stored "
-            "so downstream training code can filter or weight without "
-            "regenerating the dataset."
+            "Only 'at least one BS has surviving paths' filter applied. "
+            "Positions not visible from a BS are zero-padded in that BS's "
+            "channel. Per-sample per-BS metadata is stored so downstream "
+            "training code can filter or weight without regenerating."
         ),
         "preprocessing_note": (
             "Z is the CANONICAL complex beam-delay profile. Log-magnitude "
@@ -361,40 +491,38 @@ def main(cfg: DictConfig):
             "training-time decisions and must be applied in the data "
             "loader — they are NOT baked into this dataset."
         ),
-        "pilot_stacking_note": (
-            "channel_tap_gen.py samples paths through a sinc pulse; this "
-            "script applies a ZC pilot on top. See tracker T14."
-        ),
     }
 
     save_dict = {
-        "Z":            Z_all,          # canonical: complex BDP
-        "Y":            Y_all,
-        "link_rx_idx":  link_rx_idx,
-        "link_tx_idx":  link_tx_idx,
-        "is_los_kept":  is_los_out,
-        "shift_ns":     shift_ns_out,
-        "tx_names":     tx_names,
-        "rx_names":     rx_names,
-        "tx_pos":       tx_pos,
-        "rx_pos":       rx_pos,
-        "metadata":     dataset_meta,
+        "Z":             Z_all,
+        "Y":             Y_all,
+        "has_paths":     has_paths_out,       # (n_positions, K) bool
+        "is_los_kept":   is_los_out,          # (n_positions, K) bool
+        "shift_ns":      shift_ns_out,        # (n_positions, K) float32
+        "tx_idx":        tx_idx_out,           # (n_positions,) int32
+        "tx_names":      tx_names,
+        "rx_names":      rx_names,
+        "tx_pos":        tx_pos,
+        "rx_pos":        rx_pos,
+        "metadata":      dataset_meta,
     }
     if has_snr:
-        save_dict["snr_raw_db"]      = snr_raw_out
-        save_dict["snr_bf_db"]       = snr_bf_out
-        save_dict["snr_detector_db"] = snr_det_out
-        save_dict["p_rx_total_dbm"]  = p_rx_out
+        save_dict["snr_raw_db"]      = snr_raw_out      # (n_positions, K)
+        save_dict["snr_bf_db"]       = snr_bf_out        # (n_positions, K)
+        save_dict["snr_detector_db"] = snr_det_out       # (n_positions, K)
+        save_dict["p_rx_total_dbm"]  = p_rx_out          # (n_positions, K)
 
     np.savez(ds_file, **save_dict)
     print(f"\nSaved: {ds_file}")
 
     # ---- Sanity plot ----
-    if out_idx > 0:
-        picks, titles = [], []
+    if n_positions > 0:
+        picks_Z, titles = [], []
 
-        los_idx  = np.where(is_los_out)[0]
-        nlos_idx = np.where(~is_los_out)[0]
+        # Pick a spread of samples: some LoS-kept (from any BS), some NLoS
+        any_los = np.any(is_los_out & has_paths_out, axis=1)
+        los_idx  = np.where(any_los)[0]
+        nlos_idx = np.where(~any_los)[0]
 
         def pick_spread(arr, n):
             if len(arr) == 0:
@@ -405,26 +533,20 @@ def main(cfg: DictConfig):
             return list(arr[::step][:n])
 
         for i in pick_spread(los_idx, 3):
-            label = f"LoS-kept  rx{link_rx_idx[i]}/tx{link_tx_idx[i]}"
-            if has_snr:
-                label += f"  SNR_det={snr_det_out[i]:+.0f}dB"
-            picks.append(i)
+            label = f"pos {tx_idx_out[i]} LoS-kept"
+            picks_Z.append(Z_all[i])
             titles.append(label)
 
-        if len(nlos_idx) > 0:
-            nlos_sorted = nlos_idx[np.argsort(shift_ns_out[nlos_idx])]
-            for i in pick_spread(nlos_sorted, 6):
-                label = f"NLoS  Δτ={shift_ns_out[i]:.0f}ns"
-                if has_snr:
-                    label += f"  SNR_det={snr_det_out[i]:+.0f}dB"
-                picks.append(i)
-                titles.append(label)
+        for i in pick_spread(nlos_idx, 3):
+            label = f"pos {tx_idx_out[i]} NLoS"
+            picks_Z.append(Z_all[i])
+            titles.append(label)
 
-        if picks:
+        if picks_Z:
             fig_path = os.path.join(
                 out_dir, f"{stamp}_bdp_sanity_{cfg.scenario_name}.png"
             )
-            save_sanity_plot(Z_all, picks, titles, fig_path, M, N,
+            save_sanity_plot(picks_Z, titles, fig_path, M, N, K,
                              display_range_db=50.0)
             print(f"Sanity plot: {fig_path}")
 
