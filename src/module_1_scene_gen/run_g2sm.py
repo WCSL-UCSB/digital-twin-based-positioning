@@ -44,33 +44,37 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-def run_scenegen_box(location_id, box, output_root):
+def run_scenegen_box(location_id, box, output_root,
+                    enable_lidar_terrain=True, enable_dem_terrain=True):
     target_directory = os.path.join(output_root, location_id)
-    
-    # Check if the folder exists AND is not empty
+
     if os.path.exists(target_directory) and os.listdir(target_directory):
         print(f"[Skip] Geometry for '{location_id}' already exists in: {target_directory}")
         return
 
     os.makedirs(target_directory, exist_ok=True)
     print(f"--- Generating Geometry for: {location_id} ---")
-    
-    # CLI expects: scenegen bbox <min_lon> <min_lat> <max_lon> <max_lat>
+
     cmd = [
-        "scenegen", "bbox", 
-        str(box['min_lon']), str(box['min_lat']), 
+        "scenegen", "bbox",
+        str(box['min_lon']), str(box['min_lat']),
         str(box['max_lon']), str(box['max_lat']),
-        "--data-dir", "." 
+        "--data-dir", "."
     ]
+    if enable_lidar_terrain:
+        cmd.append("--enable-lidar-terrain")
+    if enable_dem_terrain:
+        cmd.append("--enable-dem-terrain")
+
+    print(f"[CMD] {' '.join(cmd)}")
 
     try:
         subprocess.run(cmd, cwd=target_directory, check=True, text=True)
         print(f"[Success] Geometry saved to {target_directory}")
     except Exception as e:
         print(f"[Error] {e}")
-        
         if os.path.exists(target_directory) and not os.listdir(target_directory):
-             os.rmdir(target_directory)
+            os.rmdir(target_directory)
         sys.exit(1)
 
 @hydra.main(version_base=None, config_path="../../configs/scenarios")
