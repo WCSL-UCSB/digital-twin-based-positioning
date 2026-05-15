@@ -9,13 +9,22 @@
 #   - per-sample metadata (is_los_kept, shift_ns, SNR fields) carried
 #     through for downstream evaluation analysis
 #
+# Multi-BS support:
+#   When Z has shape (N, N_beams, Lh, K) with K > 1, the trailing K axis
+#   IS the channel axis — no extra dim is appended. Output X has the same
+#   shape as Z (but float32 magnitude). The magnitude transform operates
+#   independently on each BS channel.
+#
+#   When Z has shape (N, N_beams, Lh) with K = 1 (single-BS), a trailing
+#   channel dim of 1 is appended: X shape = (N, N_beams, Lh, 1).
+#
 # Optional filters (both default to off):
 #   - min_snr_detector_db : drop samples with detector SNR below this
 #   - los_kept_only       : drop NLoS-only samples
 #
-# This is non-destructive: the upstream complex BDP file is untouched, and
-# rerunning with different parameters is cheap (no need to regenerate any
-# upstream stage).
+# For multi-BS metadata (shape (N, K)), filters use:
+#   - is_los_kept: any BS LoS → keep
+#   - snr_detector_db: max across BSs → compare to threshold
 # =============================================================================
 
 import os
@@ -33,55 +42,83 @@ load_dotenv()
 # Magnitude transform
 # ---------------------------------------------------------------------------
 
-def complex_to_cnn_input(Z, magnitude_mode, normalization, dynamic_range_db):
+def complex_to_cnn_input_batched(Z, magnitude_mode, normalization,
+                                  dynamic_range_db, batch_size=512):
     """
-    Convert a batch of complex BDPs to float32 CNN-input tensors.
+    Convert complex BDP tensor to real-valued CNN input.
 
-    Parameters
-    ----------
-    Z : complex array of shape (num_samples, ..., Lh)
-        For ULA: (num_samples, N_beams, Lh).
-        For UPA: (num_samples, M_beams, N_beams, Lh).
-    magnitude_mode  : "log" or "linear"
-    normalization   : "per_sample" or "global"
-    dynamic_range_db : float, used only when magnitude_mode == "log"
-
-    Returns
-    -------
-    X : float32 array, same leading shape as Z, with a trailing channel
-        axis appended, values in [0, 1].
+    For single-BS: Z shape (N, ...) → X shape (N, ..., 1)
+    For multi-BS:  Z shape (N, ..., K) with K > 1 → X shape (N, ..., K)
+                   K is already the channel axis, no extra dim added.
     """
-    mag = np.abs(Z).astype(np.float32)
+    n = Z.shape[0]
 
-    # Compute peak according to normalization mode
-    if normalization == "per_sample":
-        # Reduce over all axes except the leading sample axis
-        reduce_axes = tuple(range(1, mag.ndim))
-        peak = mag.max(axis=reduce_axes, keepdims=True) + 1e-12
-    elif normalization == "global":
-        peak = np.full(
-            (1,) * mag.ndim, mag.max() + 1e-12, dtype=np.float32
-        )
+    # Detect multi-BS: last axis > 1 means K BS channels already present
+    multi_bs = Z.ndim >= 3 and Z.shape[-1] > 1
+
+    if multi_bs:
+        out_shape = Z.shape  # K is the channel axis
     else:
-        raise ValueError(
-            f"normalization must be 'per_sample' or 'global', got '{normalization}'"
-        )
+        out_shape = Z.shape + (1,)  # add channel dim for single-BS
 
-    mag_norm = mag / peak
+    X = np.empty(out_shape, dtype=np.float32)
 
-    if magnitude_mode == "log":
-        X = 20.0 * np.log10(mag_norm + 1e-12)
-        X = np.maximum(X, -dynamic_range_db)
-        X = (X + dynamic_range_db) / dynamic_range_db
-    elif magnitude_mode == "linear":
-        X = mag_norm
-    else:
-        raise ValueError(
-            f"magnitude_mode must be 'log' or 'linear', got '{magnitude_mode}'"
-        )
+    # For global normalization, first pass to find peak
+    if normalization == "global":
+        global_peak = np.float32(0.0)
+        for i in range(0, n, batch_size):
+            chunk = np.abs(Z[i:i+batch_size]).astype(np.float32)
+            global_peak = max(global_peak, chunk.max())
+        global_peak += 1e-12
 
-    # Append trailing channel axis for CNN
-    return X[..., np.newaxis].astype(np.float32)
+    for i in range(0, n, batch_size):
+        j = min(i + batch_size, n)
+        mag = np.abs(Z[i:j]).astype(np.float32)
+
+        if normalization == "per_sample":
+            reduce_axes = tuple(range(1, mag.ndim))
+            peak = mag.max(axis=reduce_axes, keepdims=True) + 1e-12
+        else:
+            peak = global_peak
+
+        mag_norm = mag / peak
+
+        if magnitude_mode == "log":
+            chunk_out = 20.0 * np.log10(mag_norm + 1e-12)
+            np.maximum(chunk_out, -dynamic_range_db, out=chunk_out)
+            chunk_out = (chunk_out + dynamic_range_db) / dynamic_range_db
+        else:
+            chunk_out = mag_norm
+
+        if multi_bs:
+            X[i:j] = chunk_out
+        else:
+            X[i:j] = chunk_out[..., np.newaxis]
+
+        if (i // batch_size) % 10 == 0:
+            print(f"  Processed {j}/{n} samples")
+
+    return X
+
+
+# ---------------------------------------------------------------------------
+# Multi-BS metadata helpers
+# ---------------------------------------------------------------------------
+
+def _collapse_for_filter(arr, rule="any"):
+    """
+    Collapse a per-BS metadata field from (N, K) to (N,) for filtering.
+    If already 1D, return as-is.
+    """
+    if arr.ndim < 2:
+        return arr
+    if rule == "any":
+        return np.any(arr, axis=1)
+    elif rule == "max":
+        return np.max(arr, axis=1)
+    elif rule == "min":
+        return np.min(arr, axis=1)
+    return arr
 
 
 # ---------------------------------------------------------------------------
@@ -115,8 +152,16 @@ def main(cfg: DictConfig):
     Z = data["Z"]
     Y = data["Y"].astype(np.float32)
 
+    # Detect multi-BS
+    multi_bs = Z.ndim >= 3 and Z.shape[-1] > 1
+    K = Z.shape[-1] if multi_bs else 1
+
     print(f"  Raw Z shape : {Z.shape}  dtype={Z.dtype}")
     print(f"  Y shape     : {Y.shape}")
+    if multi_bs:
+        print(f"  Multi-BS    : K={K} (last axis is channel, no extra dim)")
+    else:
+        print(f"  Single-BS   : trailing channel dim will be appended")
 
     # ---- Read preprocessing config ----
     pp = cfg.get("ml_preprocessing", {})
@@ -128,14 +173,15 @@ def main(cfg: DictConfig):
 
     # ---- Pull per-sample metadata if available ----
     meta_fields = {}
-    for key in ("is_los_kept", "shift_ns",
+    for key in ("is_los_kept", "has_paths", "shift_ns",
                 "snr_raw_db", "snr_bf_db", "snr_detector_db",
                 "p_rx_total_dbm",
-                "link_rx_idx", "link_tx_idx"):
+                "link_rx_idx", "link_tx_idx", "tx_idx"):
         if key in data.files:
             meta_fields[key] = data[key]
 
     # ---- Build filter mask ----
+    # For multi-BS metadata (N, K), collapse to (N,) for scalar comparison
     n_total = len(Y)
     keep_mask = np.ones(n_total, dtype=bool)
 
@@ -146,7 +192,11 @@ def main(cfg: DictConfig):
                 "contain snr_detector_db. Make sure apply_link_budget.py "
                 "ran before bdp_gen.py."
             )
-        snr_mask = meta_fields["snr_detector_db"] >= float(min_snr)
+        # Use max-across-BSs: keep if the best BS exceeds threshold
+        snr_scalar = _collapse_for_filter(
+            meta_fields["snr_detector_db"], rule="max"
+        )
+        snr_mask = snr_scalar >= float(min_snr)
         keep_mask &= snr_mask
 
     if los_kept_only:
@@ -155,7 +205,11 @@ def main(cfg: DictConfig):
                 "los_kept_only is true but the BDP dataset does not "
                 "contain is_los_kept."
             )
-        keep_mask &= meta_fields["is_los_kept"]
+        # Use any-across-BSs: keep if LoS from any BS
+        los_scalar = _collapse_for_filter(
+            meta_fields["is_los_kept"], rule="any"
+        )
+        keep_mask &= los_scalar
 
     n_kept = int(keep_mask.sum())
 
@@ -163,13 +217,13 @@ def main(cfg: DictConfig):
     print(f"\n--- Filtering ---")
     print(f"  Total samples         : {n_total}")
     if min_snr is not None:
-        n_pass_snr = int((meta_fields['snr_detector_db'] >= float(min_snr)).sum())
+        n_pass_snr = int(snr_mask.sum())
         print(f"  min_snr_detector_db   : {min_snr:+.1f} dB  "
               f"-> {n_pass_snr} pass")
     else:
         print(f"  min_snr_detector_db   : (off)")
     if los_kept_only:
-        n_los = int(meta_fields["is_los_kept"].sum())
+        n_los = int(los_scalar.sum())
         print(f"  los_kept_only         : on   -> {n_los} pass")
     else:
         print(f"  los_kept_only         : off")
@@ -192,11 +246,12 @@ def main(cfg: DictConfig):
     if magnitude_mode == "log":
         print(f"  dynamic_range   : {dynamic_range_db:.1f} dB")
 
-    X = complex_to_cnn_input(
+    X = complex_to_cnn_input_batched(
         Z_kept,
         magnitude_mode=magnitude_mode,
         normalization=normalization,
         dynamic_range_db=dynamic_range_db,
+        batch_size=512,
     )
     print(f"  X shape         : {X.shape}  dtype={X.dtype}")
 
@@ -222,9 +277,12 @@ def main(cfg: DictConfig):
             "normalization":    normalization,
             "dynamic_range_db": dynamic_range_db,
         },
-        "n_total":  int(n_total),
-        "n_kept":   int(n_kept),
-        "n_los_kept": (int(meta_kept["is_los_kept"].sum())
+        "n_total":    int(n_total),
+        "n_kept":     int(n_kept),
+        "multi_bs":   multi_bs,
+        "K":          K,
+        "n_los_kept": (int(_collapse_for_filter(
+                           meta_kept["is_los_kept"], "any").sum())
                        if "is_los_kept" in meta_kept else None),
     }
 
@@ -233,7 +291,7 @@ def main(cfg: DictConfig):
         "Y":        Y_kept,
         "metadata": pp_metadata,
     }
-    # Carry through per-sample metadata fields
+    # Carry through per-sample metadata fields (keep original shapes)
     for k, v in meta_kept.items():
         save_dict[k] = v
     # Also carry through scenario-level fields so downstream can plot maps
