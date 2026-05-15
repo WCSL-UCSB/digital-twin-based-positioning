@@ -215,17 +215,17 @@ def main(cfg: DictConfig):
 
     # Array geometry (sanity-check against config)
     rx_array_meta = source_meta.get("rx_array", {})
-    M = int(rx_array_meta.get("num_rows", cfg.rx_array.num_rows))
-    N = int(rx_array_meta.get("num_cols", cfg.rx_array.num_cols))
+    M = int(rx_array_meta.get("num_rows", cfg.rx_array_geometry.num_rows))
+    N = int(rx_array_meta.get("num_cols", cfg.rx_array_geometry.num_cols))
     d_h_wl = float(rx_array_meta.get("horizontal_spacing_wl",
-                                     cfg.rx_array.horizontal_spacing))
+                                     cfg.rx_array_geometry.horizontal_spacing))
     d_v_wl = float(rx_array_meta.get("vertical_spacing_wl",
-                                     cfg.rx_array.vertical_spacing))
+                                     cfg.rx_array_geometry.vertical_spacing))
 
-    if (int(cfg.rx_array.num_rows) != M or int(cfg.rx_array.num_cols) != N):
+    if (int(cfg.rx_array_geometry.num_rows) != M or int(cfg.rx_array_geometry.num_cols) != N):
         raise ValueError(
-            f"rx_array mismatch: config {cfg.rx_array.num_rows}x"
-            f"{cfg.rx_array.num_cols}, upstream {M}x{N}. "
+            f"rx_array mismatch: config {cfg.rx_array_geometry.num_rows}x"
+            f"{cfg.rx_array_geometry.num_cols}, upstream {M}x{N}. "
             "Regenerate upstream data or fix the config."
         )
 
