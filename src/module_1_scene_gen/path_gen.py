@@ -116,7 +116,8 @@ def main(cfg: DictConfig):
 
     # ---- Load scene ONCE ----
     print(f"Loading scene: {scene_path}")
-    scene = load_scene(scene_path)
+    # merge_shapes=False preserves mesh names for keyword-based material overrides.
+    scene = load_scene(scene_path, merge_shapes=False)
     scene.frequency = frequency
     if "material_config" in cfg:
         apply_materials(scene, cfg.material_config)
