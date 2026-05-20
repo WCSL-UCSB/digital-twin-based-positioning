@@ -176,7 +176,10 @@ def main(cfg: DictConfig):
 
     # ---- Load scene ----
     print(f"Loading scene: {scene_path}")
-    scene = load_scene(scene_path)
+    
+    # merge_shapes=False preserves individual mesh names so that apply_materials()
+    # can do keyword-based material matching against object names.
+    scene = load_scene(scene_path, merge_shapes=False)
 
     # Apply materials before setting frequency so that P.527 callbacks
     # are registered and will fire when scene.frequency is assigned.

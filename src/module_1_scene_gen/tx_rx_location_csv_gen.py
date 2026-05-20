@@ -4,15 +4,22 @@
 #
 # AIM:
 #   Generates a CSV file defining transmitter (TX) and receiver (RX) positions
-#   for a given deployment scenario. Supports two deployment modes:
+#   for a given deployment scenario. Supports three deployment modes:
 #
 #     "box"      — TX positions are randomly sampled within a configured
-#                  bounding box.
+#                  bounding box. No building exclusion.
 #
 #     "polygon"  — TX positions are sampled across the entire scene footprint
-#                  with building exclusion via pre-extracted footprints from
+#                  with building exclusion via pre-extracted 2D footprints from
 #                  extract_building_footprints.py. Run that script first to
 #                  verify the footprints look correct.
+#
+#     "rooftop"  — TX positions sampled uniformly in the configured box, then
+#                  filtered against rooftop footprints read directly from the
+#                  scene's PLY mesh files. Height-aware: only roofs above the
+#                  configured z_query height count as exclusion zones, so
+#                  street-level sampling under elevated buildings is allowed.
+#                  No pre-extraction step required.
 #
 #   Supports multiple base stations via config.deployment.base_stations.
 #   Each BS is written as a separate RX row in the output CSV.
@@ -21,10 +28,11 @@
 #   - Hydra config (from configs/scenarios/*.yaml)
 #   - For polygon mode: building_footprints.npz in the scene directory
 #     (produced by extract_building_footprints.py)
+#   - For rooftop mode: *_rooftop.ply files in data/scenes/<loc_id>/mesh/
 #
 # OUTPUTS:
 #   - CSV: configs/gps_coordinates/<selected_id>_tx_rx.csv
-#   - PNG: configs/gps_coordinates/<selected_id>_tx_deployment.png
+#   - PNG: configs/gps_coordinates/<selected_id>_tx_deployment.png  (polygon mode)
 #
 # USAGE:
 #   python tx_rx_location_csv_gen.py --config-name=<scenario>
@@ -37,6 +45,7 @@
 import os
 import csv
 import time
+import struct
 import numpy as np
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -172,6 +181,193 @@ def batch_polygon_check(xs, ys, polygons):
         is_outdoor[cand_idx[inside]] = False
 
     return is_outdoor
+
+
+# ─────────────────────────────────────────────────────────────
+#  PLY-based rooftop exclusion (height-aware, no extraction step)
+# ─────────────────────────────────────────────────────────────
+
+PLY_TO_STRUCT = {
+    "char": "b",
+    "uchar": "B",
+    "int8": "b",
+    "uint8": "B",
+    "short": "h",
+    "ushort": "H",
+    "int16": "h",
+    "uint16": "H",
+    "int": "i",
+    "uint": "I",
+    "int32": "i",
+    "uint32": "I",
+    "float": "f",
+    "float32": "f",
+    "double": "d",
+    "float64": "d",
+}
+
+
+def parse_ply_header(path):
+    """Read the small PLY header so we know how to parse vertices and faces."""
+    with open(path, "rb") as f:
+        header_lines = []
+        while True:
+            line = f.readline()
+            if not line:
+                raise ValueError(f"Unexpected EOF while reading PLY header: {path}")
+            text = line.decode("ascii").strip()
+            header_lines.append(text)
+            if text == "end_header":
+                break
+        data_offset = f.tell()
+
+    elements = []
+    current = None
+    for text in header_lines:
+        parts = text.split()
+        if not parts:
+            continue
+        if parts[0] == "element":
+            current = {"name": parts[1], "count": int(parts[2]), "properties": []}
+            elements.append(current)
+        elif parts[0] == "property" and current is not None:
+            if parts[1] == "list":
+                current["properties"].append({
+                    "kind": "list",
+                    "count_type": parts[2],
+                    "item_type": parts[3],
+                    "name": parts[4],
+                })
+            else:
+                current["properties"].append({
+                    "kind": "scalar",
+                    "type": parts[1],
+                    "name": parts[2],
+                })
+
+    return data_offset, elements
+
+
+def read_rooftop_ply(path):
+    """Read vertices and polygon faces from a binary little-endian rooftop PLY."""
+    data_offset, elements = parse_ply_header(path)
+    vertices = None
+    faces = []
+
+    with open(path, "rb") as f:
+        f.seek(data_offset)
+        for element in elements:
+            count = element["count"]
+            properties = element["properties"]
+
+            if element["name"] == "vertex":
+                names = [prop["name"] for prop in properties]
+                types = [prop["type"] for prop in properties]
+                row_fmt = "<" + "".join(PLY_TO_STRUCT[t] for t in types)
+                row_size = struct.calcsize(row_fmt)
+                x_idx = names.index("x")
+                y_idx = names.index("y")
+                z_idx = names.index("z")
+
+                vertices = np.empty((count, 3), dtype=float)
+                for i in range(count):
+                    row = struct.unpack(row_fmt, f.read(row_size))
+                    vertices[i] = [row[x_idx], row[y_idx], row[z_idx]]
+
+            elif element["name"] == "face":
+                for _ in range(count):
+                    face_indices = None
+                    for prop in properties:
+                        if prop["kind"] == "scalar":
+                            scalar_fmt = "<" + PLY_TO_STRUCT[prop["type"]]
+                            f.read(struct.calcsize(scalar_fmt))
+                        else:
+                            count_fmt = "<" + PLY_TO_STRUCT[prop["count_type"]]
+                            item_count = struct.unpack(
+                                count_fmt, f.read(struct.calcsize(count_fmt))
+                            )[0]
+                            item_fmt = "<" + PLY_TO_STRUCT[prop["item_type"]] * int(item_count)
+                            values = struct.unpack(
+                                item_fmt, f.read(struct.calcsize(item_fmt))
+                            )
+                            if prop["name"] == "vertex_indices":
+                                face_indices = [int(v) for v in values]
+                    if face_indices is not None and len(face_indices) >= 3:
+                        faces.append(face_indices)
+
+            else:
+                skip_ply_element(f, count, properties)
+
+    if vertices is None:
+        raise ValueError(f"No vertices found in rooftop PLY: {path}")
+    return vertices, faces
+
+
+def skip_ply_element(file_obj, count, properties):
+    """Skip PLY elements that are not needed by the TX sampler."""
+    for _ in range(count):
+        for prop in properties:
+            if prop["kind"] == "scalar":
+                scalar_fmt = "<" + PLY_TO_STRUCT[prop["type"]]
+                file_obj.read(struct.calcsize(scalar_fmt))
+            else:
+                count_fmt = "<" + PLY_TO_STRUCT[prop["count_type"]]
+                item_count = struct.unpack(
+                    count_fmt, file_obj.read(struct.calcsize(count_fmt))
+                )[0]
+                item_fmt = "<" + PLY_TO_STRUCT[prop["item_type"]] * int(item_count)
+                file_obj.read(struct.calcsize(item_fmt))
+
+
+def load_rooftop_triangles(project_dir, loc_id, z_query_m):
+    """Load rooftop footprint triangles whose roof is above the TX height."""
+    mesh_dir = os.path.join(project_dir, "data", "scenes", loc_id, "mesh")
+    rooftop_files = sorted(
+        os.path.join(mesh_dir, name)
+        for name in os.listdir(mesh_dir)
+        if name.endswith("_rooftop.ply")
+    )
+    if not rooftop_files:
+        raise FileNotFoundError(f"No rooftop PLY files found in: {mesh_dir}")
+
+    triangles = []
+    for path in rooftop_files:
+        vertices, faces = read_rooftop_ply(path)
+        for face in faces:
+            for i in range(1, len(face) - 1):
+                tri = vertices[[face[0], face[i], face[i + 1]]]
+                if np.min(tri[:, 2]) >= z_query_m:
+                    triangles.append(tri[:, :2])
+
+    return triangles
+
+
+def points_inside_triangle(points_xy, triangle_xy):
+    """Return a boolean mask for points inside one 2D triangle."""
+    x0, y0 = triangle_xy[0]
+    x1, y1 = triangle_xy[1]
+    x2, y2 = triangle_xy[2]
+    denominator = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+    if abs(denominator) < 1e-12:
+        return np.zeros(len(points_xy), dtype=bool)
+
+    x = points_xy[:, 0]
+    y = points_xy[:, 1]
+    a = ((y1 - y2) * (x - x2) + (x2 - x1) * (y - y2)) / denominator
+    b = ((y2 - y0) * (x - x2) + (x0 - x2) * (y - y2)) / denominator
+    c = 1.0 - a - b
+    return (a >= 0.0) & (b >= 0.0) & (c >= 0.0)
+
+
+def points_on_rooftop_mask(points_xy, rooftop_triangles):
+    """Return True for points that land inside any rooftop footprint."""
+    on_rooftop = np.zeros(len(points_xy), dtype=bool)
+    for triangle in rooftop_triangles:
+        remaining = ~on_rooftop
+        if not np.any(remaining):
+            break
+        on_rooftop[remaining] = points_inside_triangle(points_xy[remaining], triangle)
+    return on_rooftop
 
 
 # ─────────────────────────────────────────────────────────────
@@ -353,6 +549,64 @@ def sample_scene_polygon(cfg, rng):
     return positions, polygons
 
 
+def sample_scene_rooftop(cfg, rng, project_dir):
+    """
+    Box-bounded sampler with rooftop exclusion via direct PLY mesh reading.
+    Height-aware: only roofs above z_query_m count as exclusion zones, so
+    street-level points under elevated buildings are accepted.
+
+    Reads *_rooftop.ply files from:
+        data/scenes/<loc_id>/mesh/
+
+    No pre-extraction step required.
+    """
+    dep = cfg.deployment
+    loc_id = cfg.selected_id
+    box = dep.tx_box
+    num_samples = dep.num_samples
+
+    z_query_m = float(dep.get("rooftop_mask_z_m", box.z_min))
+    rooftop_triangles = load_rooftop_triangles(project_dir, loc_id, z_query_m)
+    print(
+        f"  Rejecting TX points inside {len(rooftop_triangles)} rooftop "
+        f"triangles at z >= {z_query_m:.1f} m"
+    )
+
+    accepted = []
+    total_draws = 0
+    batch_size = max(num_samples, 1000)
+    max_draws = int(dep.get("max_tx_sampling_draws", num_samples * 100))
+
+    while sum(len(batch) for batch in accepted) < num_samples:
+        if total_draws >= max_draws:
+            num_accepted = sum(len(batch) for batch in accepted)
+            raise RuntimeError(
+                f"Only accepted {num_accepted}/{num_samples} TX points after "
+                f"{total_draws} draws. Increase max_tx_sampling_draws or widen tx_box."
+            )
+
+        remaining_draws = max_draws - total_draws
+        current_batch_size = min(batch_size, remaining_draws)
+
+        # Use the seeded RNG for reproducibility
+        rand_x = rng.uniform(box.x_min, box.x_max, current_batch_size)
+        rand_y = rng.uniform(box.y_min, box.y_max, current_batch_size)
+        rand_z = rng.uniform(box.z_min, box.z_max, current_batch_size)
+        candidates = np.stack([rand_x, rand_y, rand_z], axis=1)
+        total_draws += current_batch_size
+
+        rejected = points_on_rooftop_mask(candidates[:, :2], rooftop_triangles)
+        accepted.append(candidates[~rejected])
+
+    tx_positions = np.concatenate(accepted, axis=0)[:num_samples]
+    acceptance_rate = 100.0 * num_samples / max(total_draws, 1)
+    print(
+        f"  Accepted {num_samples} TX samples after {total_draws} draws "
+        f"({acceptance_rate:.1f}% acceptance rate)"
+    )
+    return tx_positions
+
+
 # ─────────────────────────────────────────────────────────────
 #  Main
 # ─────────────────────────────────────────────────────────────
@@ -383,10 +637,15 @@ def main(cfg: DictConfig):
               f"{cfg.deployment.num_samples} valid TX samples for: {loc_id}")
         tx_positions, polygons = sample_scene_polygon(cfg, rng)
 
+    elif mode == "rooftop":
+        print(f"\n[rooftop mode] Generating {cfg.deployment.num_samples} "
+              f"TX samples with PLY-rooftop exclusion for: {loc_id}")
+        tx_positions = sample_scene_rooftop(cfg, rng, project_dir)
+
     else:
         raise ValueError(
             f"Unknown deployment.mode: '{mode}'. "
-            f"Use 'box' or 'polygon'."
+            f"Use 'box', 'polygon', or 'rooftop'."
         )
 
     N = len(tx_positions)
@@ -395,7 +654,7 @@ def main(cfg: DictConfig):
     output_dir = os.path.join(project_dir, "configs", "gps_coordinates")
     os.makedirs(output_dir, exist_ok=True)
 
-    # ---- Save deployment image ----
+    # ---- Save deployment image (polygon mode only) ----
     if mode == "polygon":
         if not polygons:
             scene_dir = os.path.join(cfg.output_root, cfg.selected_id)
