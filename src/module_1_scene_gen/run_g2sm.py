@@ -30,8 +30,18 @@
 #                                in module_1 and downstream modules)
 #
 # USAGE:
-#   python run_g2sm.py --config-name=<scenario>
-#   e.g.: python run_g2sm.py --config-name=test0217
+#   This script calls the `scenegen` CLI provided by geo2sigmap. Two
+#   compatible installs are supported — pick the env that matches the
+#   variant you want, then run the script as usual:
+#
+#     conda activate g2sm_hydra            # upstream geo2sigmap
+#         OR
+#     conda activate geo2sigmap-overture   # our fork with new features
+#
+#     python run_g2sm.py --config-name=<scenario>
+#
+#   Both envs expose the same `scenegen bbox ...` CLI, so the script body
+#   is identical; only the active env decides which build runs.
 #
 # =============================================================================
 
