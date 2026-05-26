@@ -36,6 +36,7 @@
 # =============================================================================
 
 import os
+import shutil
 import subprocess
 import sys
 import hydra
@@ -45,12 +46,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def run_scenegen_box(location_id, box, output_root,
-                    enable_lidar_terrain=True, enable_dem_terrain=True):
+                    enable_lidar_terrain=True, enable_dem_terrain=True,
+                    force=False):
     target_directory = os.path.join(output_root, location_id)
 
     if os.path.exists(target_directory) and os.listdir(target_directory):
-        print(f"[Skip] Geometry for '{location_id}' already exists in: {target_directory}")
-        return
+        if not force:
+            print(f"[Skip] Geometry for '{location_id}' already exists in: "
+                  f"{target_directory}  (set force=true to overwrite)")
+            return
+        print(f"[Force] Removing existing {target_directory}")
+        shutil.rmtree(target_directory)
 
     os.makedirs(target_directory, exist_ok=True)
     print(f"--- Generating Geometry for: {location_id} ---")
@@ -99,8 +105,12 @@ def main(cfg: DictConfig):
     loc_data = gps_location[selected_id]
     box = loc_data['box']
     
-    # Run generation if the geometry doesn't already exist
-    run_scenegen_box(selected_id, box, output_root)
+    # Run generation if the geometry doesn't already exist (top-level
+    # `force: true` in the scenario YAML overrides the skip).
+    run_scenegen_box(
+        selected_id, box, output_root,
+        force=bool(cfg.get("force", False)),
+    )
 
 if __name__ == "__main__":
     main()

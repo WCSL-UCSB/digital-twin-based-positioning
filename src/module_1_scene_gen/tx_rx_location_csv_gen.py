@@ -102,12 +102,21 @@ def load_footprints(scene_dir):
     Load building footprint polygons from the .npz file produced by
     extract_building_footprints.py.
 
+    The .npz may carry both buffered polygons (`poly_NNNN`, used for the
+    point-in-polygon TX-exclusion test) and un-buffered raw polygons
+    (`poly_NNNN_raw`, used by the deployment image so the drawn outlines
+    match the true building footprints). If `_raw` keys are absent (older
+    .npz files), `vertices_raw` falls back to the buffered `vertices`.
+
     Returns
     -------
     polygons : list of dict, each with:
-        'vertices' : (V, 2) ndarray of XY polygon vertices
-        'bbox'     : (x_min, y_min, x_max, y_max) for fast pre-filtering
-        'path'     : matplotlib.path.Path for point-in-polygon tests
+        'vertices'     : (V, 2) buffered polygon (used for TX exclusion)
+        'vertices_raw' : (V, 2) un-buffered polygon (used for visualization)
+        'bbox'         : (x_min, y_min, x_max, y_max) of buffered polygon,
+                         for fast pre-filtering of the exclusion test
+        'path'         : matplotlib.path.Path on the BUFFERED polygon, for
+                         the point-in-polygon test
     """
     from matplotlib.path import Path
 
@@ -119,7 +128,13 @@ def load_footprints(scene_dir):
         return []
 
     data = np.load(npz_path, allow_pickle=True)
+    keys = set(data.files)
     num_buildings = int(data["num_buildings"][0])
+    has_raw = any(k.endswith("_raw") for k in keys)
+    npz_buffer_m = float(data["buffer_m"][0]) if "buffer_m" in keys else None
+    if npz_buffer_m is not None:
+        print(f"  .npz was written with buffer_m={npz_buffer_m:.2f} m"
+              f"{' (raw polygons also present)' if has_raw else ''}")
 
     polygons = []
     for i in range(num_buildings):
@@ -127,14 +142,20 @@ def load_footprints(scene_dir):
         if len(coords) < 3:
             continue
         xy = coords[:, :2].astype(np.float64)
+        raw_key = f"poly_{i:04d}_raw"
+        if raw_key in keys:
+            xy_raw = data[raw_key][:, :2].astype(np.float64)
+        else:
+            xy_raw = xy
         try:
             path = Path(xy)
             bbox = (xy[:, 0].min(), xy[:, 1].min(),
                     xy[:, 0].max(), xy[:, 1].max())
             polygons.append({
-                "vertices": xy,
-                "bbox":     bbox,
-                "path":     path,
+                "vertices":     xy,
+                "vertices_raw": xy_raw,
+                "bbox":         bbox,
+                "path":         path,
             })
         except Exception:
             continue
@@ -395,12 +416,17 @@ def save_deployment_image(tx_positions, polygons, output_path,
 
     fig, ax = plt.subplots(1, 1, figsize=(14, 12))
 
-    # Buildings
+    # Buildings — draw the RAW (un-buffered) outlines so the image shows
+    # the true building footprints, not the fattened exclusion polygons.
+    # `vertices_raw` falls back to `vertices` for older .npz files.
     if polygons:
         patches = []
         for poly in polygons:
             try:
-                patches.append(MplPolygon(poly["vertices"], closed=True))
+                patches.append(
+                    MplPolygon(poly.get("vertices_raw", poly["vertices"]),
+                               closed=True)
+                )
             except Exception:
                 continue
         if patches:
