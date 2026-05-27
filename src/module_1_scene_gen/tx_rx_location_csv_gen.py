@@ -4,22 +4,29 @@
 #
 # AIM:
 #   Generates a CSV file defining transmitter (TX) and receiver (RX) positions
-#   for a given deployment scenario. Supports three deployment modes:
+#   for a given deployment scenario. Supports four deployment modes:
 #
-#     "box"      — TX positions are randomly sampled within a configured
-#                  bounding box. No building exclusion.
+#     "box"          — TX positions are randomly sampled within a configured
+#                      bounding box. No building exclusion.
 #
-#     "polygon"  — TX positions are sampled across the entire scene footprint
-#                  with building exclusion via pre-extracted 2D footprints from
-#                  extract_building_footprints.py. Run that script first to
-#                  verify the footprints look correct.
+#     "polygon"      — TX positions are sampled across the entire scene
+#                      footprint with building exclusion via pre-extracted 2D
+#                      footprints from extract_building_footprints.py. Run
+#                      that script first to verify the footprints look correct.
 #
-#     "rooftop"  — TX positions sampled uniformly in the configured box, then
-#                  filtered against rooftop footprints read directly from the
-#                  scene's PLY mesh files. Height-aware: only roofs above the
-#                  configured z_query height count as exclusion zones, so
-#                  street-level sampling under elevated buildings is allowed.
-#                  No pre-extraction step required.
+#     "box_polygon"  — TX positions are sampled within the configured
+#                      bounding box, then rejected against the same
+#                      pre-extracted 2D footprints used by "polygon" mode.
+#                      Use when you want box-restricted sampling with full
+#                      building-footprint exclusion (not just rooftops).
+#
+#     "rooftop"      — TX positions sampled uniformly in the configured box,
+#                      then filtered against rooftop footprints read directly
+#                      from the scene's PLY mesh files. Height-aware: only
+#                      roofs above the configured z_query height count as
+#                      exclusion zones, so street-level sampling under
+#                      elevated buildings is allowed. No pre-extraction step
+#                      required.
 #
 #   Supports multiple base stations via config.deployment.base_stations.
 #   Each BS is written as a separate RX row in the output CSV.
@@ -165,7 +172,7 @@ def load_footprints(scene_dir):
 
 
 # ─────────────────────────────────────────────────────────────
-#  Polygon-based outdoor check (matplotlib.path, no Shapely)
+#  Polygon-based outdoor check 
 # ─────────────────────────────────────────────────────────────
 
 def batch_polygon_check(xs, ys, polygons):
@@ -575,6 +582,72 @@ def sample_scene_polygon(cfg, rng):
     return positions, polygons
 
 
+def sample_box_polygon(cfg, rng):
+    """
+    Box-bounded sampler with building exclusion via pre-extracted 2D footprints.
+    Samples uniformly within tx_box and rejects points inside any building
+    polygon loaded from building_footprints.npz.
+
+    Requires extract_building_footprints.py to have been run first.
+    """
+    dep = cfg.deployment
+    box = dep.tx_box
+    target_n = dep.num_samples
+    oversample = int(dep.get("building_exclusion", {}).get(
+        "oversample_factor", 4))
+
+    scene_dir = os.path.join(cfg.output_root, cfg.selected_id)
+    polygons = load_footprints(scene_dir)
+
+    if not polygons:
+        raise FileNotFoundError(
+            "No building footprints found.\n"
+            "Run extract_building_footprints.py first to generate them."
+        )
+
+    print(f"  Sampling extent: X [{box.x_min:.1f}, {box.x_max:.1f}]  "
+          f"Y [{box.y_min:.1f}, {box.y_max:.1f}]  "
+          f"Z [{box.z_min:.1f}, {box.z_max:.1f}]")
+    print(f"  Using {len(polygons)} building footprints for exclusion.")
+
+    valid_positions = []
+    total_tested = 0
+    t0 = time.time()
+
+    while len(valid_positions) < target_n:
+        remaining = target_n - len(valid_positions)
+        batch_n = min(remaining * oversample, 500_000)
+
+        xs = rng.uniform(box.x_min, box.x_max, batch_n)
+        ys = rng.uniform(box.y_min, box.y_max, batch_n)
+        zs = rng.uniform(box.z_min, box.z_max, batch_n)
+
+        is_outdoor = batch_polygon_check(xs, ys, polygons)
+
+        new_valid = np.column_stack([
+            xs[is_outdoor], ys[is_outdoor], zs[is_outdoor],
+        ])
+        valid_positions.extend(new_valid.tolist())
+
+        total_tested += batch_n
+        elapsed = time.time() - t0
+        rate = len(valid_positions) / max(elapsed, 0.01)
+        print(f"  ... {len(valid_positions):,}/{target_n:,} valid  "
+              f"({total_tested:,} tested, "
+              f"{len(valid_positions)/max(total_tested,1):.1%} survival, "
+              f"{rate:.0f} pts/s)")
+
+    positions = np.array(valid_positions[:target_n])
+    elapsed = time.time() - t0
+
+    print(f"\nBox sampling (with polygon exclusion) complete:")
+    print(f"  {target_n:,} valid from {total_tested:,} candidates")
+    print(f"  Survival rate: {target_n/total_tested:.1%}")
+    print(f"  Elapsed: {elapsed:.1f}s")
+
+    return positions, polygons
+
+
 def sample_scene_rooftop(cfg, rng, project_dir):
     """
     Box-bounded sampler with rooftop exclusion via direct PLY mesh reading.
@@ -663,6 +736,11 @@ def main(cfg: DictConfig):
               f"{cfg.deployment.num_samples} valid TX samples for: {loc_id}")
         tx_positions, polygons = sample_scene_polygon(cfg, rng)
 
+    elif mode == "box_polygon":
+        print(f"\n[box_polygon mode] Targeting "
+              f"{cfg.deployment.num_samples} valid TX samples for: {loc_id}")
+        tx_positions, polygons = sample_box_polygon(cfg, rng)
+
     elif mode == "rooftop":
         print(f"\n[rooftop mode] Generating {cfg.deployment.num_samples} "
               f"TX samples with PLY-rooftop exclusion for: {loc_id}")
@@ -671,7 +749,7 @@ def main(cfg: DictConfig):
     else:
         raise ValueError(
             f"Unknown deployment.mode: '{mode}'. "
-            f"Use 'box', 'polygon', or 'rooftop'."
+            f"Use 'box', 'polygon', 'box_polygon', or 'rooftop'."
         )
 
     N = len(tx_positions)
@@ -680,8 +758,8 @@ def main(cfg: DictConfig):
     output_dir = os.path.join(project_dir, "configs", "gps_coordinates")
     os.makedirs(output_dir, exist_ok=True)
 
-    # ---- Save deployment image (polygon mode only) ----
-    if mode == "polygon":
+    # ---- Save deployment image (modes that use footprints) ----
+    if mode in ("polygon", "box_polygon"):
         if not polygons:
             scene_dir = os.path.join(cfg.output_root, cfg.selected_id)
             polygons = load_footprints(scene_dir)
