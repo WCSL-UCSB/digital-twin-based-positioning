@@ -180,6 +180,13 @@ def main(cfg: DictConfig):
         if key in data.files:
             meta_fields[key] = data[key]
 
+    # Pull scenario-level fields now so we can close `data` before savez
+    # and free its memory.
+    carry_through = {}
+    for k in ("tx_pos", "rx_pos", "tx_names", "rx_names"):
+        if k in data.files:
+            carry_through[k] = data[k]
+
     # ---- Build filter mask ----
     # For multi-BS metadata (N, K), collapse to (N,) for scalar comparison
     n_total = len(Y)
@@ -235,9 +242,16 @@ def main(cfg: DictConfig):
         return
 
     # ---- Apply filter to Z, Y, and metadata ----
-    Z_kept = Z[keep_mask]
-    Y_kept = Y[keep_mask]
-    meta_kept = {k: v[keep_mask] for k, v in meta_fields.items()}
+    # When no filter is active (default), boolean indexing would force a
+    # full copy of Z (~10 GB at testboston dims). Alias instead.
+    if keep_mask.all():
+        Z_kept = Z
+        Y_kept = Y
+        meta_kept = meta_fields
+    else:
+        Z_kept = Z[keep_mask]
+        Y_kept = Y[keep_mask]
+        meta_kept = {k: v[keep_mask] for k, v in meta_fields.items()}
 
     # ---- Magnitude transform ----
     print(f"\n--- Transform ---")
@@ -295,9 +309,16 @@ def main(cfg: DictConfig):
     for k, v in meta_kept.items():
         save_dict[k] = v
     # Also carry through scenario-level fields so downstream can plot maps
-    for k in ("tx_pos", "rx_pos", "tx_names", "rx_names"):
-        if k in data.files:
-            save_dict[k] = data[k]
+    save_dict.update(carry_through)
+
+    # Release the large complex BDP tensor(s) before savez. At testboston
+    # dims Z is ~10 GB complex64; X (float32) is ~5 GB, and only X is
+    # actually serialized as a heavy array from here on.
+    import gc
+    del Z_kept
+    del Z
+    data.close()
+    gc.collect()
 
     np.savez(out_file, **save_dict)
     print(f"\nSaved: {out_file}")

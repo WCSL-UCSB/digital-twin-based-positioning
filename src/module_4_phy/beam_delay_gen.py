@@ -301,41 +301,11 @@ def main(cfg: DictConfig):
     print(f"Output dtype : complex64 (log conversion deferred to training)")
 
     # ================================================================
-    #  PHASE 1: Generate per-link BDPs into a (R, T, ...) tensor
+    #  Coverage analysis & dataset allocation
     # ================================================================
     # Single BDP shape (after M==1 squeeze): (N, Lh)  or (M, N, Lh) for UPA
     bdp_shape_single = (N, Lh) if M == 1 else (M, N, Lh)
 
-    # Full per-link BDP tensor
-    Z_per_link = np.zeros((num_rx, num_tx) + bdp_shape_single,
-                          dtype=np.complex64)
-
-    n_generated = 0
-    t0 = time.time()
-
-    for r in range(num_rx):
-        for t in range(num_tx):
-            if num_paths[r, t] == 0:
-                continue
-
-            H = H_all[r, t].astype(np.complex128)
-            Z = bdp_from_H(H, s_cp, S_conj, Lh, Lcp, Nseq)
-            if M == 1:
-                Z = Z[0]  # (N, Lh)
-
-            Z_per_link[r, t] = Z.astype(np.complex64)
-            n_generated += 1
-
-            if n_generated % 500 == 0:
-                rate = n_generated / max(time.time() - t0, 1e-6)
-                print(f"  {n_generated} links processed  ({rate:.1f} links/s)")
-
-    elapsed = time.time() - t0
-    print(f"\nPhase 1 complete: {n_generated} links in {elapsed:.1f}s")
-
-    # ================================================================
-    #  PHASE 2: Assemble dataset grouped by TX position
-    # ================================================================
     # For each TX position, we need at least one BS to have paths.
     # has_any_bs[t] = True if any BS sees this TX
     has_any_bs = np.any(num_paths > 0, axis=0)  # (T,) bool
@@ -351,7 +321,6 @@ def main(cfg: DictConfig):
           f"({100*n_positions/num_tx:.1f}%)")
 
     if multi_bs:
-        # Count zero-padded positions per BS
         for r in range(K):
             n_zeropad = int(has_any_bs.sum() - (num_paths[r] > 0).sum())
             print(f"  {rx_names[r]:12s}: {n_zeropad} positions will be zero-padded")
@@ -372,8 +341,8 @@ def main(cfg: DictConfig):
     Y_all = np.zeros((n_positions, label_dim), dtype=np.float32)
 
     # Per-sample metadata: per-BS info stored as (n_positions, K) or scalar
-    is_los_out   = np.zeros((n_positions, K), dtype=bool)
-    shift_ns_out = np.zeros((n_positions, K), dtype=np.float32)
+    is_los_out    = np.zeros((n_positions, K), dtype=bool)
+    shift_ns_out  = np.zeros((n_positions, K), dtype=np.float32)
     has_paths_out = np.zeros((n_positions, K), dtype=bool)
 
     if has_snr:
@@ -387,9 +356,17 @@ def main(cfg: DictConfig):
     # TX indices that made it into the dataset (for reference)
     tx_idx_out = np.zeros(n_positions, dtype=np.int32)
 
-    out_idx = 0
+    # ================================================================
+    #  Compute BDPs directly into Z_all (no per-link intermediate buffer)
+    # ================================================================
+    # Zero-padding for "this BS does not see this position" is free: Z_all
+    # is already zero-initialized, so we just skip those (r, t) pairs.
+    n_generated = 0
+    t0 = time.time()
+
     valid_tx_indices = np.where(has_any_bs)[0]
 
+    out_idx = 0
     for t in valid_tx_indices:
         Y_all[out_idx] = tx_pos[t, :label_dim]
         tx_idx_out[out_idx] = t
@@ -406,21 +383,36 @@ def main(cfg: DictConfig):
                 snr_det_out[out_idx, r] = float(snr_detector_db[r, t])
                 p_rx_out[out_idx, r]    = float(p_rx_total_dbm[r, t])
 
-            if has:
-                bdp = Z_per_link[r, t]  # (N, Lh) or (M, N, Lh)
-            else:
-                # Zero-pad: this BS doesn't see this position
-                bdp = np.zeros(bdp_shape_single, dtype=np.complex64)
+            if not has:
+                continue  # zero-fill already done at Z_all allocation
 
+            H = H_all[r, t].astype(np.complex128)
+            Z = bdp_from_H(H, s_cp, S_conj, Lh, Lcp, Nseq)
+            if M == 1:
+                Z = Z[0]  # (N, Lh)
+
+            Z_c64 = Z.astype(np.complex64)
             if multi_bs:
-                # Place into the K-th channel slot
-                Z_all[out_idx][..., r] = bdp
+                Z_all[out_idx][..., r] = Z_c64
             else:
-                Z_all[out_idx] = bdp
+                Z_all[out_idx] = Z_c64
+            n_generated += 1
+
+            if n_generated % 500 == 0:
+                rate = n_generated / max(time.time() - t0, 1e-6)
+                print(f"  {n_generated} links processed  ({rate:.1f} links/s)")
 
         out_idx += 1
 
     assert out_idx == n_positions
+    elapsed = time.time() - t0
+    print(f"\nBDP generation complete: {n_generated} links in {elapsed:.1f}s")
+
+    # Free the (R, T, M, N, T_fixed) channel tensor before the savez step,
+    # which itself transiently buffers a copy of the largest output array.
+    import gc
+    del H_all
+    gc.collect()
 
     print(f"\nDataset shapes:")
     print(f"  Z: {Z_all.shape}  dtype={Z_all.dtype}")
