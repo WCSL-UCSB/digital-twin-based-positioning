@@ -182,6 +182,15 @@ def load_preprocessed(data_dir, scenario_name):
         if k in data.files:
             extras[k] = data[k]
 
+    # Keep pre-collapse per-BS copies for per-BS-count metrics and ablation.
+    for k in ("has_paths", "is_los_kept", "snr_detector_db"):
+        if k in extras and getattr(extras[k], "ndim", 1) >= 2:
+            extras[k + "_per_bs"] = extras[k].copy()
+
+    # The split artifact is keyed on the dataset basename so a regenerated
+    # dataset can never silently reuse a stale split.
+    extras["_dataset_basename"] = os.path.basename(ds_file)
+
     _collapse_multi_bs_metadata(extras, "is_los_kept", rule="any")
     _collapse_multi_bs_metadata(extras, "has_paths",   rule="any")
     _collapse_multi_bs_metadata(extras, "shift_ns",    rule="min")

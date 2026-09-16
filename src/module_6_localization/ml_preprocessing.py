@@ -43,18 +43,27 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 def complex_to_cnn_input_batched(Z, magnitude_mode, normalization,
-                                  dynamic_range_db, batch_size=512):
+                                  dynamic_range_db, batch_size=512,
+                                  channels_present=None):
     """
     Convert complex BDP tensor to real-valued CNN input.
 
     For single-BS: Z shape (N, ...) → X shape (N, ..., 1)
     For multi-BS:  Z shape (N, ..., K) with K > 1 → X shape (N, ..., K)
                    K is already the channel axis, no extra dim added.
+
+    channels_present overrides the multi-BS heuristic: pass True when the last
+    axis is KNOWN to be the BS-channel axis (e.g. after a keep_bs slice), so a
+    single-BS subset Z=(N,...,1) keeps its channel axis instead of getting a
+    spurious extra one appended (which would route a ULA input into the 3D path).
     """
     n = Z.shape[0]
 
     # Detect multi-BS: last axis > 1 means K BS channels already present
-    multi_bs = Z.ndim >= 3 and Z.shape[-1] > 1
+    if channels_present is not None:
+        multi_bs = bool(channels_present)
+    else:
+        multi_bs = Z.ndim >= 3 and Z.shape[-1] > 1
 
     if multi_bs:
         out_shape = Z.shape  # K is the channel axis
@@ -142,9 +151,16 @@ def main(cfg: DictConfig):
     OmegaConf.resolve(cfg)
     project_dir = cfg.project_dir
 
+    # ---- Read preprocessing config ----
+    pp = cfg.get("ml_preprocessing", {})
+
     # ---- Load BDP dataset ----
-    bdp_dir = os.path.join(project_dir, "data", "ml_datasets", cfg.scenario_name)
-    bdp_file = get_latest_bdp_dataset(bdp_dir, cfg.scenario_name)
+    # `ml_preprocessing.source_scenario` lets a derived scenario (e.g. a BS
+    # subset) read an EXISTING BDP while writing under its own scenario_name,
+    # so we don't have to re-run the whole ray-trace pipeline to drop a BS.
+    src_scn = str(pp.get("source_scenario", cfg.scenario_name))
+    bdp_dir = os.path.join(project_dir, "data", "ml_datasets", src_scn)
+    bdp_file = get_latest_bdp_dataset(bdp_dir, src_scn)
     print(f"Loading BDP dataset: {os.path.basename(bdp_file)}")
     data = np.load(bdp_file, allow_pickle=True)
     bdp_meta = data["metadata"].item()
@@ -163,10 +179,14 @@ def main(cfg: DictConfig):
     else:
         print(f"  Single-BS   : trailing channel dim will be appended")
 
-    # ---- Read preprocessing config ----
-    pp = cfg.get("ml_preprocessing", {})
+    # ---- Read transform config ----
     min_snr = pp.get("min_snr_detector_db", None)
     los_kept_only = bool(pp.get("los_kept_only", False))
+    # Drop samples with zero coverage over the (possibly subset) BS set: a point
+    # that reaches NO kept base station has an all-zero input and cannot be
+    # localized. For a BS-subset deployment this makes the dataset faithful — we
+    # never train/test on points the deployment can't see.
+    drop_uncovered = bool(pp.get("drop_uncovered", False))
     magnitude_mode = str(pp.get("magnitude_mode", "log")).lower()
     normalization = str(pp.get("normalization", "per_sample")).lower()
     dynamic_range_db = float(pp.get("dynamic_range_db", 50.0))
@@ -186,6 +206,30 @@ def main(cfg: DictConfig):
     for k in ("tx_pos", "rx_pos", "tx_names", "rx_names"):
         if k in data.files:
             carry_through[k] = data[k]
+
+    # ---- Optional BS subset (drop/keep specific base stations) ----
+    # `ml_preprocessing.keep_bs: [i, j, ...]` selects a subset of the K base
+    # stations BEFORE normalization, so the per-sample peak is recomputed over
+    # only the kept BS. This yields a faithful K'<K deployment, not a post-hoc
+    # channel drop (which would leave the peak set by an absent BS).
+    keep_bs = pp.get("keep_bs", None)
+    subset_applied = False
+    if keep_bs is not None and multi_bs:
+        subset_applied = True
+        keep_bs = [int(i) for i in keep_bs]
+        names = carry_through.get("rx_names")
+        lbl = ", ".join(str(names[i]) for i in keep_bs) if names is not None else str(keep_bs)
+        print(f"\n--- BS subset ---\n  keep_bs : {keep_bs}  ({lbl})  of K={K}")
+        Z = Z[..., keep_bs]
+        for key, v in list(meta_fields.items()):
+            if getattr(v, "ndim", 1) >= 2 and v.shape[-1] == K:
+                meta_fields[key] = v[..., keep_bs]
+        for key in ("rx_pos", "rx_names"):
+            if key in carry_through and len(carry_through[key]) == K:
+                carry_through[key] = carry_through[key][keep_bs]
+        K = len(keep_bs)
+        multi_bs = K > 1
+        print(f"  -> new K: {K}, Z {Z.shape}")
 
     # ---- Build filter mask ----
     # For multi-BS metadata (N, K), collapse to (N,) for scalar comparison
@@ -217,6 +261,19 @@ def main(cfg: DictConfig):
             meta_fields["is_los_kept"], rule="any"
         )
         keep_mask &= los_scalar
+
+    if drop_uncovered:
+        if "has_paths" not in meta_fields:
+            raise KeyError(
+                "drop_uncovered is true but the BDP dataset does not contain "
+                "has_paths. Make sure the upstream stages carried it through."
+            )
+        # keep if ANY kept BS reaches the point (has_paths already sliced to the
+        # kept subset above, so this is coverage over the subset deployment)
+        cov_scalar = _collapse_for_filter(meta_fields["has_paths"], rule="any")
+        keep_mask &= cov_scalar
+        print(f"  drop_uncovered        : on   -> {int(cov_scalar.sum())} covered "
+              f"({100.0*cov_scalar.mean():.1f}%)")
 
     n_kept = int(keep_mask.sum())
 
@@ -266,6 +323,9 @@ def main(cfg: DictConfig):
         normalization=normalization,
         dynamic_range_db=dynamic_range_db,
         batch_size=512,
+        # After a keep_bs slice the last axis IS the BS-channel axis (even when
+        # the subset is a single BS), so don't append a spurious channel dim.
+        channels_present=True if subset_applied else None,
     )
     print(f"  X shape         : {X.shape}  dtype={X.dtype}")
 

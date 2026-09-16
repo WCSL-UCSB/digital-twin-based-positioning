@@ -222,6 +222,10 @@ def main(cfg: DictConfig):
     phi_t_3d   = data["phi_t"]
     num_valid  = data["num_valid_paths"]  # (num_rx, num_tx) int
 
+    # Per-bounce interaction types (path classification). Optional: only present
+    # if path_gen.py captured it. Shape (max_depth, num_rx, num_tx, max_paths).
+    inter_4d   = data["interactions"] if "interactions" in data.files else None
+
     rx_names   = data["rx_names"]
     rx_pos     = data["rx_pos"]
     rx_look_at = data["rx_look_at"]
@@ -365,6 +369,15 @@ def main(cfg: DictConfig):
         (num_rx, num_tx, M, N, max_paths_out), dtype=np.float64
     )
 
+    # Carry interaction types through the filter (if captured upstream).
+    if inter_4d is not None:
+        max_depth = inter_4d.shape[0]
+        interactions_out = np.zeros(
+            (max_depth, num_rx, num_tx, max_paths_out), dtype=np.int16
+        )
+    else:
+        interactions_out = None
+
     for r in range(num_rx):
         for t in range(num_tx):
             k = int(num_kept[r, t])
@@ -400,6 +413,8 @@ def main(cfg: DictConfig):
             phi_t_out[r, t, :k]    = phi_t_3d[r, t, idx]
             min_delay_ns_out[r, t] = min_delay_ns
             tau_per_element_ns_out[r, t, :, :, :k] = tau_per_el_ns
+            if interactions_out is not None:
+                interactions_out[:, r, t, :k] = inter_4d[:, r, t, idx]
 
     # ---- Verification print ----
     print("\n" + "=" * 70)
@@ -459,6 +474,11 @@ def main(cfg: DictConfig):
         "polarization_traced": metadata.get("polarization_traced", "V"),
     }
 
+    # Optional: interaction types carried through the filter.
+    extra_arrays = {}
+    if interactions_out is not None:
+        extra_arrays["interactions"] = interactions_out
+
     print(f"\nSaving to {out_file}")
     np.savez(
         out_file,
@@ -485,6 +505,8 @@ def main(cfg: DictConfig):
         tx_look_at          = data["tx_look_at"],
         # metadata
         metadata            = filter_metadata,
+        # optional extras (e.g. interactions, if captured upstream)
+        **extra_arrays,
     )
     print(f"Saved {int(num_kept.sum())} total surviving paths across "
           f"{int((num_kept > 0).sum())} links.")

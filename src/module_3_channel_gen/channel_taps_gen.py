@@ -1,22 +1,28 @@
 # =============================================================================
-# channel_tap_gen.py — Convert calibrated paths to LoS-referenced channel taps
+# channel_tap_gen.py — Convert calibrated paths to first-arrival-referenced taps
 # =============================================================================
 #
 # Consumes the calibrated .npz from apply_link_budget.py and produces a
 # complex channel-tap tensor per link, sampled on a uniform time grid at
-# `dt` spacing with tau = 0 aligned to the geometric line-of-sight arrival
-# (computed from TX and RX positions, independent of whether the LoS path
-# itself survived filtering).
+# `dt` spacing with tau = 0 aligned to the EARLIEST SURVIVING PATH of the
+# link (the first arrival kept after filtering/adjusting), for LoS and NLoS
+# links alike.
 #
 # Time reference convention:
-#     tau = 0  ≡  arrival time of a straight-line free-space path TX -> RX
+#     tau = 0  ≡  arrival time of the earliest surviving path of the link
 #
-# For LoS-kept links, the first surviving path lands at tau ≈ 0.
-# For NLoS-only links, the first surviving path lands at tau > 0, reflecting
-# the excess path length of the earliest reflection relative to LoS.
+# Rationale: the earliest-arrival instant is the only time reference a real
+# receiver can form without knowing its own position. The previous geometric
+# LoS reference (tau_los = ||tx-rx||/c) is computed from the true TX/RX
+# positions, so baking it into the delay axis is not inference-realizable and,
+# for NLoS-only links, leaks the straight-line range via the first-arrival
+# offset. We therefore keep the filter's min-normalized frame as-is.
 #
-# The boolean flag `is_los_kept[r, t]` is written to the output so
-# downstream code can distinguish the two regimes.
+# The per-link geometric LoS time and the NLoS first-arrival excess
+# (shift_applied = min_delay - tau_los, snapped/clamped) are still COMPUTED and
+# SAVED as diagnostics — the boolean flag `is_los_kept[r, t]` lets downstream
+# code distinguish the two regimes — but the excess is no longer added to the
+# taps.
 # =============================================================================
 
 import os
@@ -113,10 +119,10 @@ def get_pulse_fn(pulse_type):
 
 def channel_gen_link(
     a,                    # (k,) complex, in sqrt(W) per element
-    tau_center_ns,        # (k,) delays at array center, already LoS-referenced
+    tau_center_ns,        # (k,) delays at array center, already first-arrival ref
     omega_h,              # (k,) inter-element phase, horizontal (rad)
     omega_v,              # (k,) inter-element phase, vertical (rad)
-    tau_per_elem_ns,      # (M, N, k) per-element delays, already LoS-referenced
+    tau_per_elem_ns,      # (M, N, k) per-element delays, already first-arrival ref
     f_carrier,
     M, N,
     dt, T_fixed,
@@ -127,9 +133,9 @@ def channel_gen_link(
     """
     Generate (M, N, T_fixed) complex channel taps for one link.
 
-    All delays passed in must already be referenced to geometric LoS
-    (tau = 0 at the straight-line TX->RX arrival time). This function
-    does not rebase delays; the caller is responsible for that.
+    All delays passed in must already be referenced to the link's time origin
+    (tau = 0 at the earliest surviving path). This function does not rebase
+    delays; the caller is responsible for that.
     """
     k = a.size
     if k == 0:
@@ -138,9 +144,10 @@ def channel_gen_link(
     tau_center_s = tau_center_ns * 1e-9
     t_grid_s = np.arange(T_fixed, dtype=float) * dt
 
-    # Carrier phase per path, referenced to LoS.
-    # Note: since tau_center is LoS-referenced, this encodes phase
-    # relative to the LoS arrival, not absolute propagation phase.
+    # Carrier phase per path, referenced to the earliest surviving path.
+    # Note: tau_center is first-arrival-referenced, so this encodes phase
+    # relative to the first arrival, not absolute propagation phase. (For the
+    # log-magnitude BDP used in training, a per-link constant phase is moot.)
     carrier = np.exp(-1j * 2.0 * np.pi * f_carrier * tau_center_s)
 
     # Spatial phase (M, N, k)
@@ -262,34 +269,43 @@ def main(cfg: DictConfig):
 
     num_rx, num_tx, P_max = tau_ns_all.shape
 
-    # ---- Compute geometric LoS delays and per-link LoS rebase shifts ----
+    # ---- Diagnostics only: geometric LoS delay and NLoS first-arrival excess
+    # These are NOT applied to the taps (delays stay first-arrival-referenced);
+    # they are computed to set is_los_kept and to record the NLoS excess for
+    # downstream per-sample metadata / error breakdowns.
     # tau_los_ns[r, t] = 1e9 * ||tx_pos[t] - rx_pos[r]|| / c
     dxyz = tx_pos[np.newaxis, :, :] - rx_pos[:, np.newaxis, :]   # (R, T, 3)
     d_geom = np.linalg.norm(dxyz, axis=-1)                       # (R, T) meters
     tau_los_ns_all = 1e9 * d_geom / speed_of_light               # (R, T) ns
 
-    # filter's min_delay is the raw delay of the earliest surviving path
-    # (in ns). The filter subtracted it so that filtered tau_ns starts at 0.
-    # To rebase to geometric LoS, we need to add (min_delay - tau_los_ns)
-    # to every delay, so the LoS instant becomes the new zero.
+    # filter's min_delay is the raw delay of the earliest surviving path (ns).
+    # shift_ns = min_delay - tau_los is how much later the first kept arrival
+    # is than the straight-line LoS instant (the NLoS excess for NLoS links).
     shift_ns_all = min_delay_all - tau_los_ns_all  # (R, T)
 
-    # ---- Classify and clamp shifts ----
-    # Case A (LoS-kept): |shift| < LOS_TOL_NS. The min arrival ≈ LoS.
-    #                    Zero the shift exactly.
+    # ---- Classify links by the first-arrival-vs-LoS offset (diagnostic) ----
+    # Case A (LoS-kept): |shift| < LOS_TOL_NS. The first kept arrival ≈ LoS.
     # Case B (NLoS-only): shift > +LOS_TOL_NS. First arrival is later than
-    #                     LoS would have been. Keep the shift.
-    # Case C (pathological): shift < -LOS_TOL_NS. A path is arriving earlier
-    #                        than straight-line geometry permits. Not physical.
-    #                        Clamp shift to zero and warn.
+    #                     LoS would have been (the direct path was filtered).
+    # Case C (pathological): shift < -LOS_TOL_NS on a link that HAS paths —
+    #                        arrival earlier than straight-line geometry
+    #                        permits, which is not physical. Empty links are
+    #                        excluded: their min_delay defaults to 0, making
+    #                        shift = -tau_los spuriously negative, so counting
+    #                        them would mislabel every empty link pathological.
+    has_paths_link = n_kept_all > 0
     is_los_kept = np.abs(shift_ns_all) < LOS_TOL_NS
-    pathological = shift_ns_all < -LOS_TOL_NS
+    pathological = (shift_ns_all < -LOS_TOL_NS) & has_paths_link
     n_pathological = int(pathological.sum())
 
-    # Apply clamps
+    # Recorded NLoS excess (diagnostic, saved as "shift_applied" for backward
+    # compatibility with downstream readers): 0 for LoS-kept, pathological, and
+    # empty links; the positive first-arrival-over-LoS offset for NLoS-only
+    # links. This is NOT added to the taps.
     shift_applied = shift_ns_all.copy()
     shift_applied[is_los_kept] = 0.0
     shift_applied[pathological] = 0.0
+    shift_applied[~has_paths_link] = 0.0   # empty links carry no time reference
 
     # ---- Diagnostic summary ----
     array_type = "UPA" if M > 1 else "ULA"
@@ -301,7 +317,7 @@ def main(cfg: DictConfig):
           f"window={window_ns:.1f} ns")
     print(f"Pulse    : {pulse_type}, Tsym={pulse_Tsym*1e9:.1f} ns, beta={pulse_beta}")
     print(f"TTD      : {include_ttd}  |  SpatialPhase: {include_sp}")
-    print(f"tau = 0    : geometric LoS (computed from rx_pos / tx_pos)")
+    print(f"tau = 0    : earliest surviving path (first arrival, per link)")
 
     has_paths = n_kept_all > 0
     n_non_empty = int(has_paths.sum())
@@ -344,17 +360,19 @@ def main(cfg: DictConfig):
                 skipped_empty += 1
                 continue
 
-            # Rebase delays to geometric LoS.
-            # The filter stored tau_ns normalized so the min-arrival path is
-            # at 0. Adding shift_applied[r, t] puts it in the LoS-referenced
-            # frame where tau=0 is the geometric LoS arrival time.
-            shift = float(shift_applied[r, t])
-            tau_ns_rel = tau_ns_all[r, t, :k] + shift
-            tpe_ns_rel = tau_per_el_all[r, t, :, :, :k] + shift
+            # Reference delays to the earliest surviving path. The filter
+            # already min-normalized tau_ns so the first kept path sits at 0,
+            # for LoS and NLoS links alike. We deliberately do NOT rebase to
+            # the geometric-LoS instant: it is computed from the (unknown at
+            # inference) TX/RX positions, so baking it into the delay axis is
+            # non-realizable and, for NLoS links, leaks the straight-line
+            # range. shift_applied[r, t] is still recorded as a per-link
+            # diagnostic but is no longer added to the taps.
+            tau_ns_rel = tau_ns_all[r, t, :k]
+            tpe_ns_rel = tau_per_el_all[r, t, :, :, :k]
 
             # Drop paths that fall outside the tap window.
-            # After rebasing, valid delays should satisfy 0 <= tau < window.
-            # Negative values shouldn't happen post-clamp, but guard anyway.
+            # Delays are min-normalized (>= 0); the lower guard is defensive.
             in_window = (tau_ns_rel >= -dt * 1e9) & (tau_ns_rel < window_ns)
             if not np.any(in_window):
                 skipped_window += 1
@@ -399,9 +417,10 @@ def main(cfg: DictConfig):
         print(f"  paths used       : {int(n_used_all[rr, tt])}")
         print(f"  |H| peak         : {peak_val:.4e} at {loc}, tap {peak_tap}")
         print(f"  peak tap time    : {peak_tap * dt * 1e9:.2f} ns")
-        print(f"  geometric LoS    : {tau_los_ns_all[rr, tt]:.2f} ns (abs)")
+        print(f"  geometric LoS    : {tau_los_ns_all[rr, tt]:.2f} ns (abs, diag)")
         print(f"  LoS kept?        : {bool(is_los_kept[rr, tt])}")
-        print(f"  applied shift    : {shift_applied[rr, tt]:+.3f} ns")
+        print(f"  NLoS excess      : {shift_applied[rr, tt]:+.3f} ns "
+              f"(recorded, NOT applied)")
 
     # ---- Save ----
     out_dir = os.path.join(project_dir, "data", "channel_data")
@@ -423,7 +442,7 @@ def main(cfg: DictConfig):
                                   "beta": pulse_beta},
         "include_true_time_delay": include_ttd,
         "include_spatial_phase":   include_sp,
-        "time_reference":          "geometric_los_per_link",
+        "time_reference":          "earliest_surviving_path_per_link",
         "los_tolerance_ns":        LOS_TOL_NS,
         "los_kept_count":          n_los_kept,
         "nlos_only_count":         n_nlos_only,
