@@ -8,10 +8,10 @@
 #
 # USAGE:
 #   1. Generate the TX/RX CSV first:
-#        python src/module_1_scene_gen/tx_rx_location_csv_gen.py --config-name=nyc_rooftop_200ep
+#        python src/module_1_scene_gen/tx_rx_location_csv_gen.py --config-name=nyc/nyc_high_rise_rooftop_200ep
 #
 #   2. Plot the generated layout:
-#        python src/module_1_scene_gen/visualize_deployment.py --config-name=nyc_rooftop_200ep
+#        python src/module_1_scene_gen/visualize_deployment.py --config-name=nyc/nyc_high_rise_rooftop_200ep
 #
 # OUTPUT:
 #   data/scenes/<selected_id>/deployment_layout_<scenario_name>.png

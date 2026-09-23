@@ -67,7 +67,7 @@
 #       side_m: 250.0                # half-side: scene query bbox is 2*side_m
 #       coordinate_file: ...         # consumed by downstream pipeline stages
 #
-#   scenario YAML (e.g. testboston.yaml) — per-experiment knobs only:
+#   scenario YAML (e.g. boston_cambridge_street_test.yaml) — per-experiment knobs only:
 #     force: false               # top-level; overwrite an existing data/scenes/<id>/
 #                                # (shared with run_g2sm.py)
 #
