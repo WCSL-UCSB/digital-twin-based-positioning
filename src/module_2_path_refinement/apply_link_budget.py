@@ -21,7 +21,9 @@
 # =============================================================================
 
 import os
-import glob
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+from src.utils.dataset_io import resolve_input, pinned, write_sidecar  # noqa: E402
 import time
 import numpy as np
 import hydra
@@ -64,14 +66,6 @@ def noise_power_watts(bandwidth_hz, noise_figure_db, temperature_k):
 # I/O helpers
 # ---------------------------------------------------------------------------
 
-def get_latest_filtered_npz(path_dir, scenario_name):
-    pattern = os.path.join(path_dir, f"*_filtered_{scenario_name}.npz")
-    files = glob.glob(pattern)
-    if not files:
-        raise FileNotFoundError(f"No filtered .npz matching: {pattern}")
-    return max(files, key=os.path.getctime)
-
-
 def print_snr_distribution(label, snr_db, mask):
     """Pretty-print a percentile summary of an SNR tensor over a mask."""
     if not np.any(mask):
@@ -99,8 +93,9 @@ def main(cfg: DictConfig):
 
     # ---- Load filtered paths ----
     in_dir = os.path.join(project_dir, "data", "path_data", "refined_paths")
-    in_file = get_latest_filtered_npz(in_dir, cfg.scenario_name)
-    print(f"Loading filtered paths: {os.path.basename(in_file)}")
+    in_file = resolve_input(
+        os.path.join(in_dir, f"*_filtered_{cfg.scenario_name}.npz"),
+        pinned(cfg, "filtered_npz"), label="filtered paths")
     data = np.load(in_file, allow_pickle=True)
     filter_meta = data["metadata"].item()
 
@@ -273,6 +268,8 @@ def main(cfg: DictConfig):
 
     print(f"\nSaving calibrated paths to {out_file}")
     np.savez(out_file, **save_dict)
+    write_sidecar(out_file, stage="apply_link_budget", cfg=cfg,
+                  inputs={"filtered_npz": in_file}, summary=lb_metadata)
     print("Done.")
 
 

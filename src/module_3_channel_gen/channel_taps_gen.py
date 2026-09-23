@@ -26,7 +26,9 @@
 # =============================================================================
 
 import os
-import glob
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+from src.utils.dataset_io import resolve_input, pinned, write_sidecar  # noqa: E402
 import time
 import numpy as np
 import hydra
@@ -191,14 +193,6 @@ def channel_gen_link(
 # I/O
 # ---------------------------------------------------------------------------
 
-def get_latest_calibrated_npz(path_dir, scenario_name):
-    pattern = os.path.join(path_dir, f"*_calibrated_{scenario_name}.npz")
-    files = glob.glob(pattern)
-    if not files:
-        raise FileNotFoundError(f"No calibrated .npz matching: {pattern}")
-    return max(files, key=os.path.getctime)
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -210,8 +204,9 @@ def main(cfg: DictConfig):
 
     # ---- Load calibrated paths ----
     in_dir = os.path.join(project_dir, "data", "path_data", "calibrated_paths")
-    in_file = get_latest_calibrated_npz(in_dir, cfg.scenario_name)
-    print(f"Loading calibrated paths: {os.path.basename(in_file)}")
+    in_file = resolve_input(
+        os.path.join(in_dir, f"*_calibrated_{cfg.scenario_name}.npz"),
+        pinned(cfg, "calibrated_npz"), label="calibrated paths")
     data = np.load(in_file, allow_pickle=True)
     calib_meta = data["metadata"].item()
 
@@ -464,6 +459,8 @@ def main(cfg: DictConfig):
         rx_look_at     = data["rx_look_at"],
         metadata       = channel_meta,
     )
+    write_sidecar(out_file, stage="channel_taps_gen", cfg=cfg,
+                  inputs={"calibrated_npz": in_file}, summary=channel_meta)
     print(f"Generated {generated} links | "
           f"{skipped_empty} empty, {skipped_window} out-of-window")
 

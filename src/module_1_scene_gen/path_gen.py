@@ -24,6 +24,7 @@ from sionna.rt import (
     RadioMaterial, PathSolver,
 )
 from configs.materials import apply_ground_materials
+from src.utils.dataset_io import write_sidecar
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +361,8 @@ def _finalize_from_shards(shard_dir, fingerprint, output_dir, cfg, loc_id,
         rx_look_at      = rx_look_at,
         metadata        = metadata,
     )
+    write_sidecar(filename, stage="path_gen", cfg=cfg,
+                  inputs={"scene_xml": scene_path}, summary=metadata)
     return filename, complete
 
 

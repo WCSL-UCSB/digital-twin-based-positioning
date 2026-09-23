@@ -33,7 +33,9 @@
 # =============================================================================
 
 import os
-import glob
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+from src.utils.dataset_io import resolve_input, pinned, write_sidecar  # noqa: E402
 import time
 import numpy as np
 import hydra
@@ -141,22 +143,6 @@ def _complex_to_display_log(Z, display_range_db=50.0):
 # I/O
 # ---------------------------------------------------------------------------
 
-def get_latest_channels_npz(path_dir, scenario_name):
-    pattern = os.path.join(path_dir, f"*_channels_{scenario_name}.npz")
-    files = glob.glob(pattern)
-    if not files:
-        raise FileNotFoundError(f"No channels .npz matching: {pattern}")
-    return max(files, key=os.path.getctime)
-
-
-def get_latest_calibrated_npz(path_dir, scenario_name):
-    pattern = os.path.join(path_dir, f"*_calibrated_{scenario_name}.npz")
-    files = glob.glob(pattern)
-    if not files:
-        return None
-    return max(files, key=os.path.getctime)
-
-
 # ---------------------------------------------------------------------------
 # Sanity plot
 # ---------------------------------------------------------------------------
@@ -235,8 +221,9 @@ def main(cfg: DictConfig):
 
     # ---- Load channels ----
     in_dir = os.path.join(project_dir, "data", "channel_data")
-    ch_file = get_latest_channels_npz(in_dir, cfg.scenario_name)
-    print(f"Loading channels: {os.path.basename(ch_file)}")
+    ch_file = resolve_input(
+        os.path.join(in_dir, f"*_channels_{cfg.scenario_name}.npz"),
+        pinned(cfg, "channels_npz"), label="channels")
     ch_data = np.load(ch_file, allow_pickle=True)
     channel_meta = ch_data["metadata"].item()
 
@@ -254,9 +241,11 @@ def main(cfg: DictConfig):
 
     # ---- Optional SNR pass-through ----
     calib_dir = os.path.join(project_dir, "data", "path_data", "calibrated_paths")
-    calib_file = get_latest_calibrated_npz(calib_dir, cfg.scenario_name)
+    calib_file = resolve_input(
+        os.path.join(calib_dir, f"*_calibrated_{cfg.scenario_name}.npz"),
+        pinned(cfg, "calibrated_npz"), label="calibrated paths (SNR pass-through)",
+        required=False)
     if calib_file is not None:
-        print(f"Loading SNR from: {os.path.basename(calib_file)}")
         calib_data = np.load(calib_file, allow_pickle=True)
         snr_raw_db      = calib_data["snr_raw_db"]       # (R, T)
         snr_bf_db       = calib_data["snr_bf_db"]         # (R, T)
@@ -506,6 +495,9 @@ def main(cfg: DictConfig):
 
     np.savez(ds_file, **save_dict)
     print(f"\nSaved: {ds_file}")
+    write_sidecar(ds_file, stage="beam_delay_gen", cfg=cfg,
+                  inputs={"channels_npz": ch_file, "calibrated_npz": calib_file},
+                  summary=dataset_meta)
 
     # ---- Sanity plot ----
     if n_positions > 0:

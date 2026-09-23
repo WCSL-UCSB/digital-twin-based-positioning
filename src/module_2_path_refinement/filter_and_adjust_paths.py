@@ -21,7 +21,9 @@
 # =============================================================================
 
 import os
-import glob
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+from src.utils.dataset_io import resolve_input, pinned, write_sidecar  # noqa: E402
 import time
 import numpy as np
 import hydra
@@ -148,14 +150,6 @@ def compute_element_delays_ns(theta_az, theta_el, M, N, d_h_wl, d_v_wl, frequenc
 # I/O helpers
 # ---------------------------------------------------------------------------
 
-def get_latest_npz(path_dir, scenario_name):
-    pattern = os.path.join(path_dir, f"*_{scenario_name}_paths.npz")
-    files = glob.glob(pattern)
-    if not files:
-        raise FileNotFoundError(f"No .npz files found matching: {pattern}")
-    return max(files, key=os.path.getctime)
-
-
 def resolve_frequency(cfg, meta_frequency_hz):
     """
     Source-of-truth: the .npz metadata. If the config also specifies a
@@ -197,8 +191,9 @@ def main(cfg: DictConfig):
 
     # ---- Load traced paths ----
     path_dir = os.path.join(project_dir, "data", "path_data")
-    npz_file = get_latest_npz(path_dir, cfg.scenario_name)
-    print(f"Loading raw paths: {os.path.basename(npz_file)}")
+    npz_file = resolve_input(
+        os.path.join(path_dir, f"*_{cfg.scenario_name}_paths.npz"),
+        pinned(cfg, "paths_npz"), label="raw paths")
 
     data = np.load(npz_file, allow_pickle=True)
     metadata = data["metadata"].item()
@@ -508,6 +503,8 @@ def main(cfg: DictConfig):
         # optional extras (e.g. interactions, if captured upstream)
         **extra_arrays,
     )
+    write_sidecar(out_file, stage="filter_and_adjust_paths", cfg=cfg,
+                  inputs={"paths_npz": npz_file}, summary=filter_metadata)
     print(f"Saved {int(num_kept.sum())} total surviving paths across "
           f"{int((num_kept > 0).sum())} links.")
 

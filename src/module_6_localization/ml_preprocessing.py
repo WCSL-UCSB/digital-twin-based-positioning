@@ -28,7 +28,9 @@
 # =============================================================================
 
 import os
-import glob
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+from src.utils.dataset_io import resolve_input, pinned, write_sidecar  # noqa: E402
 import time
 import numpy as np
 import hydra
@@ -134,14 +136,6 @@ def _collapse_for_filter(arr, rule="any"):
 # I/O
 # ---------------------------------------------------------------------------
 
-def get_latest_bdp_dataset(path_dir, scenario_name):
-    pattern = os.path.join(path_dir, f"*_bdp_dataset_{scenario_name}.npz")
-    files = glob.glob(pattern)
-    if not files:
-        raise FileNotFoundError(f"No BDP dataset matching: {pattern}")
-    return max(files, key=os.path.getctime)
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -160,8 +154,9 @@ def main(cfg: DictConfig):
     # so we don't have to re-run the whole ray-trace pipeline to drop a BS.
     src_scn = str(pp.get("source_scenario", cfg.scenario_name))
     bdp_dir = os.path.join(project_dir, "data", "ml_datasets", src_scn)
-    bdp_file = get_latest_bdp_dataset(bdp_dir, src_scn)
-    print(f"Loading BDP dataset: {os.path.basename(bdp_file)}")
+    bdp_file = resolve_input(
+        os.path.join(bdp_dir, f"*_bdp_dataset_{src_scn}.npz"),
+        pinned(cfg, "bdp_npz"), label="BDP dataset")
     data = np.load(bdp_file, allow_pickle=True)
     bdp_meta = data["metadata"].item()
 
@@ -382,6 +377,8 @@ def main(cfg: DictConfig):
 
     np.savez(out_file, **save_dict)
     print(f"\nSaved: {out_file}")
+    write_sidecar(out_file, stage="ml_preprocessing", cfg=cfg,
+                  inputs={"bdp_npz": bdp_file}, summary=pp_metadata)
     print(f"  Samples         : {n_kept}")
     print(f"  Input shape     : {X.shape}")
     print(f"  Label shape     : {Y_kept.shape}")

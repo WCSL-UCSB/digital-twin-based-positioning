@@ -14,22 +14,15 @@
 # =============================================================================
 
 import os
-import glob
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+from src.utils.dataset_io import resolve_input  # noqa: E402
 import argparse
 import numpy as np
 from scipy.constants import speed_of_light
 from dotenv import load_dotenv
 
 load_dotenv()
-
-
-def get_latest_filtered_npz(project_dir, scenario_name):
-    path_dir = os.path.join(project_dir, "data", "path_data", "refined_paths")
-    pattern = os.path.join(path_dir, f"*_filtered_{scenario_name}.npz")
-    files = glob.glob(pattern)
-    if not files:
-        raise FileNotFoundError(f"No filtered .npz matching: {pattern}")
-    return max(files, key=os.path.getctime)
 
 
 def inspect_link(d, r, t):
@@ -142,12 +135,16 @@ def main():
                     help="Number of individual links to inspect in detail")
     ap.add_argument("--project-dir", type=str,
                     default=os.environ.get("PROJECT_DIR", "."))
+    ap.add_argument("--npz", type=str, default=None,
+                    help="Use this file instead of the newest one for --scenario.")
     args = ap.parse_args()
 
     scenario = args.scenario or "nyc_high_rise_test_ml"
 
-    fpath = get_latest_filtered_npz(args.project_dir, scenario)
-    print(f"Loading: {os.path.basename(fpath)}")
+    fpath = resolve_input(
+        os.path.join(args.project_dir, "data", "path_data", "refined_paths",
+                     f"*_filtered_{scenario}.npz"),
+        args.npz, label="filtered paths")
     d = np.load(fpath, allow_pickle=True)
 
     num_kept = d["num_paths_after_filter"]

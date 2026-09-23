@@ -8,8 +8,10 @@ Added:
     make_split — deterministic train/test split used by every model script.
 """
 
-import glob
 import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
+from src.utils.dataset_io import resolve_input  # noqa: E402
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -135,15 +137,12 @@ def load_building_polygons(scene_dir):
 # Preprocessed dataset loading
 # ---------------------------------------------------------------------------
 
-def get_latest_preprocessed(data_dir, scenario_name):
-    pattern = os.path.join(data_dir, f"*_preprocessed_{scenario_name}.npz")
-    files = glob.glob(pattern)
-    if not files:
-        raise FileNotFoundError(
-            f"No preprocessed dataset matching: {pattern}\n"
-            "Run ml_preprocess.py before training."
-        )
-    return max(files, key=os.path.getctime)
+def get_latest_preprocessed(data_dir, scenario_name, explicit=None):
+    """Newest `*_preprocessed_<scenario>.npz` by filename timestamp, or the
+    `inputs.preprocessed_npz` pin when one is set (see src/utils/dataset_io.py)."""
+    return resolve_input(
+        os.path.join(data_dir, f"*_preprocessed_{scenario_name}.npz"),
+        explicit, label="preprocessed dataset")
 
 
 def _collapse_multi_bs_metadata(extras, key, rule="any"):
@@ -162,9 +161,8 @@ def _collapse_multi_bs_metadata(extras, key, rule="any"):
         extras[key] = np.min(v, axis=1)
 
 
-def load_preprocessed(data_dir, scenario_name):
-    ds_file = get_latest_preprocessed(data_dir, scenario_name)
-    print(f"--- Loading preprocessed dataset: {os.path.basename(ds_file)} ---")
+def load_preprocessed(data_dir, scenario_name, explicit=None):
+    ds_file = get_latest_preprocessed(data_dir, scenario_name, explicit)
 
     data = np.load(ds_file, allow_pickle=False)
     X = data["X"]

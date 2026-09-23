@@ -19,7 +19,9 @@
 # =============================================================================
 
 import os
-import glob
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+from src.utils.dataset_io import resolve_input  # noqa: E402
 import argparse
 import numpy as np
 from scipy.constants import speed_of_light
@@ -44,15 +46,6 @@ def circ_std_rad(angles):
     R = np.abs(z.mean()) if z.size else 0.0
     R = min(max(R, 1e-12), 1.0)
     return float(np.sqrt(-2.0 * np.log(R)))
-
-
-def get_latest_paths_npz(project_dir, scenario_name):
-    path_dir = os.path.join(project_dir, "data", "path_data")
-    pattern = os.path.join(path_dir, f"*_{scenario_name}_paths.npz")
-    files = glob.glob(pattern)
-    if not files:
-        raise FileNotFoundError(f"No *_paths.npz matching: {pattern}")
-    return max(files, key=os.path.getctime)
 
 
 def classify_path(depth_col):
@@ -233,10 +226,14 @@ def main():
                     help="Number of (rx, tx) links to print in detail.")
     ap.add_argument("--max-paths", type=int, default=12,
                     help="Max paths shown per link table.")
+    ap.add_argument("--npz", type=str, default=None,
+                    help="Use this file instead of the newest one for --scenario.")
     args = ap.parse_args()
 
-    npz = get_latest_paths_npz(args.project_dir, args.scenario)
-    print(f"Loading: {os.path.basename(npz)}")
+    npz = resolve_input(
+        os.path.join(args.project_dir, "data", "path_data",
+                     f"*_{args.scenario}_paths.npz"),
+        args.npz, label="raw paths")
     d = np.load(npz, allow_pickle=True)
 
     meta = d["metadata"].item() if "metadata" in d.files else {}

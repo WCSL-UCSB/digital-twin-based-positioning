@@ -21,7 +21,9 @@
 # =============================================================================
 
 import os
-import glob
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+from src.utils.dataset_io import resolve_input  # noqa: E402
 import argparse
 import numpy as np
 from dotenv import load_dotenv
@@ -29,11 +31,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 NONE = 0
-
-
-def get_latest(path_dir, pattern):
-    files = glob.glob(os.path.join(path_dir, pattern))
-    return max(files, key=os.path.getctime) if files else None
 
 
 def los_path_index(interactions, num_kept, r, t):
@@ -50,14 +47,15 @@ def main():
     ap.add_argument("--scenario", type=str, required=True)
     ap.add_argument("--project-dir", type=str, default=os.environ.get("PROJECT_DIR", "."))
     ap.add_argument("--num-pos", type=int, default=10)
+    ap.add_argument("--npz", type=str, default=None,
+                    help="Use this file instead of the newest one for --scenario.")
     args = ap.parse_args()
 
     proj = args.project_dir
-    ds = get_latest(os.path.join(proj, "data", "ml_datasets", args.scenario),
-                    f"*_bdp_dataset_{args.scenario}.npz")
-    if ds is None:
-        raise FileNotFoundError(f"No *_bdp_dataset_{args.scenario}.npz in ml_datasets")
-    print(f"Loading BDP dataset: {os.path.basename(ds)}")
+    ds = resolve_input(
+        os.path.join(proj, "data", "ml_datasets", args.scenario,
+                     f"*_bdp_dataset_{args.scenario}.npz"),
+        args.npz, label="BDP dataset")
     d = np.load(ds, allow_pickle=True)
     meta = d["metadata"].item()
 

@@ -20,6 +20,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+from src.utils.dataset_io import pinned  # noqa: E402
 
 import hydra
 import numpy as np
@@ -77,7 +79,8 @@ def main(cfg: DictConfig):
     tile_size_m = float(_cfg_get(cfg, "training.tile_size_m", 25.0))
     buffer_m = float(_cfg_get(cfg, "training.buffer_m", 0.0))
 
-    X, Y, extras = data_mod.load_preprocessed(data_dir, cfg.scenario_name)
+    X, Y, extras = data_mod.load_preprocessed(
+        data_dir, cfg.scenario_name, pinned(cfg, "preprocessed_npz"))
     split = splits_mod.get_or_create_split(
         os.path.join(data_dir, "splits"),
         extras.get("_dataset_basename", "dataset"), Y,

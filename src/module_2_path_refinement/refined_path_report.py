@@ -29,7 +29,9 @@
 # =============================================================================
 
 import os
-import glob
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+from src.utils.dataset_io import resolve_input  # noqa: E402
 import argparse
 import numpy as np
 from scipy.constants import speed_of_light
@@ -58,15 +60,6 @@ def classify_path(depth_col):
     if present == [DIFFRACTION]:
         return "Diffraction", nb
     return "+".join(_TYPE_SHORT.get(c, str(c)) for c in present), nb
-
-
-def get_latest_filtered_npz(project_dir, scenario_name):
-    path_dir = os.path.join(project_dir, "data", "path_data", "refined_paths")
-    pattern = os.path.join(path_dir, f"*_filtered_{scenario_name}.npz")
-    files = glob.glob(pattern)
-    if not files:
-        raise FileNotFoundError(f"No filtered .npz matching: {pattern}")
-    return max(files, key=os.path.getctime)
 
 
 def link_table(d, r, t, interactions, d_h_wl, d_v_wl, max_paths_show, checks):
@@ -130,10 +123,14 @@ def main():
     ap.add_argument("--project-dir", type=str, default=os.environ.get("PROJECT_DIR", "."))
     ap.add_argument("--num-links", type=int, default=5)
     ap.add_argument("--max-paths", type=int, default=16)
+    ap.add_argument("--npz", type=str, default=None,
+                    help="Use this file instead of the newest one for --scenario.")
     args = ap.parse_args()
 
-    npz = get_latest_filtered_npz(args.project_dir, args.scenario)
-    print(f"Loading: {os.path.basename(npz)}")
+    npz = resolve_input(
+        os.path.join(args.project_dir, "data", "path_data", "refined_paths",
+                     f"*_filtered_{args.scenario}.npz"),
+        args.npz, label="filtered paths")
     d = np.load(npz, allow_pickle=True)
     meta = d["metadata"].item()
 

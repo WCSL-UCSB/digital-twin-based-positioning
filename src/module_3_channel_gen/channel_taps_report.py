@@ -25,7 +25,9 @@
 # =============================================================================
 
 import os
-import glob
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+from src.utils.dataset_io import resolve_input  # noqa: E402
 import argparse
 import numpy as np
 from dotenv import load_dotenv
@@ -33,13 +35,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 NONE, SPECULAR, DIFFUSE, REFRACTION, DIFFRACTION = 0, 1, 2, 4, 8
-
-
-def get_latest(path_dir, pattern):
-    files = glob.glob(os.path.join(path_dir, pattern))
-    if not files:
-        return None
-    return max(files, key=os.path.getctime)
 
 
 def los_path_index(interactions, num_kept, r, t):
@@ -56,14 +51,15 @@ def main():
     ap.add_argument("--scenario", type=str, required=True)
     ap.add_argument("--project-dir", type=str, default=os.environ.get("PROJECT_DIR", "."))
     ap.add_argument("--num-links", type=int, default=8)
+    ap.add_argument("--npz", type=str, default=None,
+                    help="Use this file instead of the newest one for --scenario.")
     args = ap.parse_args()
 
     proj = args.project_dir
-    ch_npz = get_latest(os.path.join(proj, "data", "channel_data"),
-                        f"*_channels_{args.scenario}.npz")
-    if ch_npz is None:
-        raise FileNotFoundError(f"No *_channels_{args.scenario}.npz in data/channel_data")
-    print(f"Loading channels: {os.path.basename(ch_npz)}")
+    ch_npz = resolve_input(
+        os.path.join(proj, "data", "channel_data",
+                     f"*_channels_{args.scenario}.npz"),
+        args.npz, label="channels")
     ch = np.load(ch_npz, allow_pickle=True)
     meta = ch["metadata"].item()
 
