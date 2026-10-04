@@ -3,10 +3,10 @@
 # =============================================================================
 #
 # AIM:
-#   Produces a building_footprints.npz / .png pair in the scene directory.
+#   Produces a building_footprints.npz / .png pair in a per-buffer directory.
 #   Auto-detects the scene source and uses the right extraction strategy:
 #
-#     * BostonTwin scenes (presence of <selected_id>.geojson + tileinfo) →
+#     * BostonTwin scenes (presence of matching .geojson + tileinfo files) →
 #       read polygon footprints directly from the GeoJSON, project from
 #       WGS84 to local CRS metres, subtract the scene centre. This is
 #       authoritative (BPDA ground footprints) and avoids the trap of
@@ -35,7 +35,7 @@
 #           building_exclusion:
 #             buffer_m: 1.0      # set to 0.0 to disable buffering
 #
-# OUTPUTS (in the scene directory):
+# OUTPUTS (under <scene>/footprints/buffer_<buffer_m>m/):
 #   - building_footprints.npz   — polygon vertices for each building
 #                                 (scene-local metres, Nx2 arrays;
 #                                 includes the exclusion buffer)
@@ -47,6 +47,9 @@
 # =============================================================================
 
 import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+from src.utils.scene_io import resolve_scene_path, footprint_buffer_m, buffered_footprint_path
 import glob
 import json
 import numpy as np
@@ -394,29 +397,40 @@ def save_verification_image(polygons, building_names, output_path,
 #  Main
 # ─────────────────────────────────────────────────────────────
 
-def _detect_scene_source(scene_dir, scene_name):
-    """Return 'bostontwin' or 'mesh' based on what files are in scene_dir.
+def _detect_scene_source(scene_path):
+    """Return (source, BostonTwin metadata basename) beside the resolved XML.
 
-    BostonTwin scenes ship <selected_id>.geojson + <selected_id>_tileinfo.geojson
-    alongside the XML. OSM/G2SM scenes ship a `mesh/` subfolder with
-    *_rooftop.ply files. If neither pattern matches we return None and the
-    caller decides what to do.
+    Prefer metadata named after the XML or its directory. A relocated scene
+    may retain its original GeoJSON names; accept a unique matching pair,
+    but never silently choose between multiple unrelated pairs.
     """
-    gj = os.path.join(scene_dir, f"{scene_name}.geojson")
-    ti = os.path.join(scene_dir, f"{scene_name}_tileinfo.geojson")
-    if os.path.isfile(gj) and os.path.isfile(ti):
-        return "bostontwin"
+    scene_dir = os.path.dirname(scene_path)
+    names = []
+    for ti in sorted(glob.glob(os.path.join(scene_dir, "*_tileinfo.geojson"))):
+        name = os.path.basename(ti)[:-len("_tileinfo.geojson")]
+        if os.path.isfile(os.path.join(scene_dir, f"{name}.geojson")):
+            names.append(name)
+    for preferred in (Path(scene_path).stem, Path(scene_dir).name):
+        if preferred in names:
+            return "bostontwin", preferred
+    if len(names) == 1:
+        return "bostontwin", names[0]
+    if len(names) > 1:
+        raise ValueError(
+            f"Ambiguous BostonTwin metadata in {scene_dir}: {names}. "
+            "Use a scene XML or directory name matching the intended metadata."
+        )
     if glob.glob(os.path.join(scene_dir, "mesh", "*_rooftop.ply")):
-        return "mesh"
-    return None
+        return "mesh", None
+    return None, None
 
 
 @hydra.main(version_base=None, config_path="../../configs/scenarios")
 def main(cfg: DictConfig):
     OmegaConf.resolve(cfg)
 
-    loc_id = cfg.selected_id
-    scene_dir = os.path.join(cfg.output_root, loc_id)
+    scene_path = resolve_scene_path(cfg)
+    scene_dir = os.path.dirname(scene_path)
 
     if not os.path.isdir(scene_dir):
         raise FileNotFoundError(
@@ -428,21 +442,17 @@ def main(cfg: DictConfig):
     # sampling stays a small margin clear of building edges. This compensates
     # for the BostonTwin polygon-vs-3D-mesh thickness gap and avoids TX
     # samples landing visually on walls in the rendered scene.
-    buffer_m =1
-    if hasattr(cfg, "deployment") and hasattr(cfg.deployment, "building_exclusion"):
-        be = cfg.deployment.building_exclusion
-        if "buffer_m" in be:
-            buffer_m = float(be.buffer_m)
+    buffer_m = footprint_buffer_m(cfg)
 
-    print(f"=== Building Footprint Extraction: {loc_id} ===")
+    print(f"=== Building Footprint Extraction: {os.path.basename(scene_dir)} ===")
     print(f"Scene directory: {scene_dir}")
     print(f"Polygon exclusion buffer: {buffer_m:.2f} m\n")
 
-    source = _detect_scene_source(scene_dir, loc_id)
+    source, scene_name = _detect_scene_source(scene_path)
     if source == "bostontwin":
         print(f"  Source: BostonTwin (reading polygons from GeoJSON)")
         polygons, raw_polygons, names = extract_footprints_bostontwin(
-            scene_dir, loc_id, buffer_m=buffer_m,
+            scene_dir, scene_name, buffer_m=buffer_m,
         )
     elif source == "mesh":
         print(f"  Source: OSM/G2SM (projecting rooftop meshes)")
@@ -453,7 +463,7 @@ def main(cfg: DictConfig):
         raise FileNotFoundError(
             f"Could not detect scene source in {scene_dir}.\n"
             f"Expected either:\n"
-            f"  - {loc_id}.geojson + {loc_id}_tileinfo.geojson  (BostonTwin)\n"
+            f"  - <scene>.geojson + <scene>_tileinfo.geojson  (BostonTwin)\n"
             f"  - mesh/*_rooftop.ply files                      (OSM/G2SM)"
         )
 
@@ -463,11 +473,7 @@ def main(cfg: DictConfig):
 
     # ---- Get scene bounding box (best-effort) ----
     scene_bbox = None
-    # BostonTwin writes XML as <loc_id>.xml; G2SM writes scene.xml.
-    for fname in (f"{loc_id}.xml", "scene.xml"):
-        scene_path = os.path.join(scene_dir, fname)
-        if not os.path.exists(scene_path):
-            continue
+    if os.path.exists(scene_path):
         try:
             from sionna.rt import load_scene
             scene = load_scene(scene_path)
@@ -480,8 +486,7 @@ def main(cfg: DictConfig):
                   f"X [{scene_bbox[0]:.1f}, {scene_bbox[1]:.1f}]  "
                   f"Y [{scene_bbox[2]:.1f}, {scene_bbox[3]:.1f}]")
         except Exception as e:
-            print(f"\n  Could not load {fname} for bbox: {e}")
-        break
+            print(f"\n  Could not load {scene_path} for bbox: {e}")
 
     # ---- RX position for reference ----
     rx_pos = None
@@ -489,13 +494,14 @@ def main(cfg: DictConfig):
         rx_pos = list(cfg.deployment.rx_position)
 
     # ---- Save footprints (both buffered and raw, plus buffer metadata) ----
-    footprint_path = os.path.join(scene_dir, "building_footprints.npz")
+    footprint_path = buffered_footprint_path(scene_dir, buffer_m)
+    os.makedirs(os.path.dirname(footprint_path), exist_ok=True)
     save_footprints(polygons, raw_polygons, names, footprint_path,
                     buffer_m=buffer_m)
 
     # ---- Save verification image (use RAW polygons so the buffer halo
     #      doesn't obscure the real building outlines in the PNG) ----
-    img_path = os.path.join(scene_dir, "building_footprints.png")
+    img_path = os.path.splitext(footprint_path)[0] + ".png"
     source_label = ("BostonTwin GeoJSON" if source == "bostontwin"
                     else "rooftop projection")
     save_verification_image(

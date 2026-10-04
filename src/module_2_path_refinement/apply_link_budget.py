@@ -10,9 +10,8 @@
 #   - per-link aggregate received power (dBm)
 #   - per-link SNR at three stages:
 #       * raw       : per-element, pre-correlation, pre-beamforming
-#       * bf        : post-beamforming, pre-correlation
-#       * detector  : post-beamforming, post-matched-filter (what a real
-#                     detector would see)
+#       * bf        : ideal coherent-array SNR estimate, pre-correlation
+#       * detector  : ideal array + matched-filter SNR estimate
 #
 # NO thresholding is applied. All SNR quantities are stored as diagnostics
 # so downstream code can decide what to do with weak links. Detection,
@@ -24,6 +23,7 @@ import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from src.utils.dataset_io import resolve_input, pinned, write_sidecar  # noqa: E402
+from src.utils.radio_power import diagnostic_gains, positive_float, positive_int
 import time
 import numpy as np
 import hydra
@@ -44,8 +44,12 @@ def db_to_lin(db):
 
 
 def lin_to_db(x):
-    """Safe dB with a floor to avoid log(0)."""
-    return 10.0 * np.log10(np.maximum(x, 1e-300))
+    """Convert nonnegative finite power ratios; zero power is -inf dB."""
+    x = np.asarray(x, dtype=np.float64)
+    if np.any(~np.isfinite(x)) or np.any(x < 0):
+        raise ValueError("Linear power must be finite and nonnegative")
+    with np.errstate(divide="ignore"):
+        return 10.0 * np.log10(x)
 
 
 def watts_to_dbm(p_w):
@@ -58,8 +62,13 @@ def noise_power_watts(bandwidth_hz, noise_figure_db, temperature_k):
 
         N = k * T * B * F
     """
+    bandwidth_hz = positive_float(bandwidth_hz, "link_budget.bandwidth_hz")
+    temperature_k = positive_float(temperature_k, "link_budget.temperature_k")
+    if not np.isfinite(noise_figure_db) or noise_figure_db < 0:
+        raise ValueError("link_budget.noise_figure_db must be finite and nonnegative")
     nf_lin = db_to_lin(noise_figure_db)
-    return K_BOLTZMANN * temperature_k * bandwidth_hz * nf_lin
+    return positive_float(K_BOLTZMANN * temperature_k * bandwidth_hz * nf_lin,
+                          "receiver noise power")
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +81,12 @@ def print_snr_distribution(label, snr_db, mask):
         print(f"  {label}: (no data)")
         return
     vals = snr_db[mask]
+    finite = np.isfinite(vals)
+    if not np.all(finite):
+        print(f"  {label}: {int((~finite).sum())} zero-power link(s), SNR = -inf")
+        vals = vals[finite]
+    if vals.size == 0:
+        return
     pcts = [5, 25, 50, 75, 95]
     qs = np.percentile(vals, pcts)
     print(f"  {label}")
@@ -108,9 +123,19 @@ def main(cfg: DictConfig):
     bandwidth_hz  = float(lb.bandwidth_hz)
     temperature_k = float(lb.get("temperature_k", 290.0))
 
-    # Diagnostic gain stages (not multiplied into `a`)
-    array_gain_db      = float(lb.get("array_gain_db", 0.0))
-    processing_gain_db = float(lb.get("processing_gain_db", 0.0))
+    # Derive ideal diagnostic gains from the actual filtered array and pilot.
+    # Old YAML array_gain_db/processing_gain_db values are deliberately unused.
+    array_meta = filter_meta.get("rx_array")
+    if not array_meta:
+        raise ValueError("Filtered data lacks RX array metadata; regenerate refinement")
+    rows = positive_int(array_meta["num_rows"], "filtered array rows")
+    columns = positive_int(array_meta["num_cols"], "filtered array columns")
+    sequence_length = positive_int(cfg.training_sequence.length, "pilot length")
+    array_gain_db, processing_gain_db = diagnostic_gains(rows, columns, sequence_length)
+    for name, value in (("tx_power_dbm", p_tx_dbm), ("tx_antenna_gain_db", g_tx_db),
+                        ("rx_antenna_gain_db", g_rx_db)):
+        if not np.isfinite(value):
+            raise ValueError(f"link_budget.{name} must be finite")
 
     # ---- Calibration scalar for amplitudes ----
     # |a_calibrated_p|^2 = P_tx_lin * G_tx_lin * G_rx_lin * |a_p|^2  (watts)
@@ -120,7 +145,7 @@ def main(cfg: DictConfig):
     p_tx_w   = db_to_lin(p_tx_dbm - 30.0)
     g_tx_lin = db_to_lin(g_tx_db)
     g_rx_lin = db_to_lin(g_rx_db)
-    amp_scale = np.sqrt(p_tx_w * g_tx_lin * g_rx_lin)
+    amp_scale = positive_float(np.sqrt(p_tx_w * g_tx_lin * g_rx_lin), "amplitude scale")
 
     # ---- Noise floor (scalar, same for every link) ----
     n_power_w   = noise_power_watts(bandwidth_hz, noise_fig_db, temperature_k)
@@ -138,23 +163,36 @@ def main(cfg: DictConfig):
 
     print("\n--- Downstream gains (diagnostic only, not in `a`) ---")
     print(f"  Array gain          : {array_gain_db:+.1f} dB "
-          f"(applied during beamforming)")
+          f"(ideal coherent-array estimate)")
     print(f"  Processing gain     : {processing_gain_db:+.1f} dB "
-          f"(applied during matched filter)")
+          f"(ideal matched-filter estimate)")
     print(f"  Total downstream    : {array_gain_db + processing_gain_db:+.1f} dB")
 
     # ---- Load path data ----
     a_all    = data["a"]                        # (num_rx, num_tx, P) complex
     num_kept = data["num_paths_after_filter"]   # (num_rx, num_tx) int
+    if a_all.ndim != 3 or not all(a_all.shape[:2]):
+        raise ValueError("Filtered amplitudes must have shape (RX, TX, path) with nonempty device axes")
     num_rx, num_tx, P_max = a_all.shape
+    if (num_kept.shape != (num_rx, num_tx)
+            or not np.issubdtype(num_kept.dtype, np.integer)
+            or np.any(num_kept < 0) or np.any(num_kept > P_max)):
+        raise ValueError("Filtered path counts must be (RX, TX) integers within the stored path axis")
+    valid = np.arange(P_max) < num_kept[..., None]
+    if not np.isfinite(a_all[valid]).all():
+        raise ValueError("Valid filtered path coefficients must be finite")
 
     # ---- Calibrate amplitudes uniformly ----
-    a_calibrated = a_all * amp_scale  # phases unchanged
+    # Counts are authoritative; padding must never contribute to power.
+    # Promote before squaring to retain very weak complex64 input paths.
+    a_calibrated = np.where(valid, a_all, 0).astype(np.complex128) * amp_scale
 
     # ---- Per-link aggregate received power (watts, then dBm) ----
-    # Pad entries beyond num_kept are zero and contribute nothing.
+    # Incoherent sum: interference between paths is not included here.
     power_per_path_w = np.abs(a_calibrated) ** 2      # (num_rx, num_tx, P)
     p_rx_total_w     = power_per_path_w.sum(axis=-1)  # (num_rx, num_tx)
+    if not np.isfinite(p_rx_total_w).all():
+        raise ValueError("Calibrated received power overflowed; check amplitudes and link-budget settings")
     has_paths        = num_kept > 0
 
     p_rx_total_dbm = np.where(
@@ -166,9 +204,9 @@ def main(cfg: DictConfig):
     snr_raw_db = np.where(
         has_paths, p_rx_total_dbm - n_power_dbm, -np.inf
     )
-    # Stage 2: post-beamforming, pre-correlation
+    # Stage 2: ideal coherent-array gain, not a measured beam output
     snr_bf_db = snr_raw_db + array_gain_db
-    # Stage 3: post-beamforming, post-matched-filter (what a detector sees)
+    # Stage 3: ideal array + matched-filter gain, not realized detector SNR
     snr_detector_db = snr_bf_db + processing_gain_db
 
     # ---- Diagnostic distribution report ----
@@ -185,10 +223,10 @@ def main(cfg: DictConfig):
         "Stage 1: per-element, pre-correlation", snr_raw_db, has_paths
     )
     print_snr_distribution(
-        "Stage 2: post-beamforming, pre-correlation", snr_bf_db, has_paths
+        "Stage 2: ideal array estimate, pre-correlation", snr_bf_db, has_paths
     )
     print_snr_distribution(
-        "Stage 3: post-beamforming, post-matched-filter", snr_detector_db, has_paths
+        "Stage 3: ideal array + matched-filter estimate", snr_detector_db, has_paths
     )
 
     # ---- Sanity check: one link in full detail ----
@@ -210,7 +248,7 @@ def main(cfg: DictConfig):
     # ---- Save ----
     out_dir = os.path.join(project_dir, "data", "path_data", "calibrated_paths")
     os.makedirs(out_dir, exist_ok=True)
-    stamp = time.strftime("%Y%m%d_%H%M%S")
+    stamp = f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}"
     out_file = os.path.join(
         out_dir, f"{stamp}_calibrated_{cfg.scenario_name}.npz"
     )
@@ -225,19 +263,28 @@ def main(cfg: DictConfig):
             "bandwidth_hz":       bandwidth_hz,
             "noise_figure_db":    noise_fig_db,
             "temperature_k":      temperature_k,
+            "noise_power_w":      float(n_power_w),
             "noise_power_dbm":    float(n_power_dbm),
             "amplitude_scale_lin": float(amp_scale),
             # Diagnostic gains — recorded but not applied to `a`
             "array_gain_db":      array_gain_db,
             "processing_gain_db": processing_gain_db,
+            "array_num_rows":     rows,
+            "array_num_cols":     columns,
+            "pilot_length":       sequence_length,
+            "gain_source":        "array dimensions and pilot length",
         },
         "units": {
             "a":               "sqrt(W), per element, pre-beamforming",
-            "p_rx_total_dbm":  "dBm, aggregate per link",
+            "p_rx_total_dbm":  "dBm, incoherent sum of valid path powers per element",
             "snr_raw_db":      "dB, per-element pre-correlation",
-            "snr_bf_db":       "dB, post-beamforming pre-correlation",
-            "snr_detector_db": "dB, post-beamforming post-matched-filter",
+            "snr_bf_db":       "dB, ideal array-gain estimate, pre-correlation",
+            "snr_detector_db": "dB, ideal array-plus-pilot-gain estimate",
         },
+        "validity_source": "num_paths_after_filter",
+        "zero_power_convention": "-inf dBm and -inf SNR, including valid zero-amplitude paths",
+        "noise_model": "k_B * temperature_k * bandwidth_hz * 10**(noise_figure_db/10)",
+        "snr_kind": "incoherent_path_power_with_ideal_processing_gains",
         "thresholding_note": (
             "No thresholding is applied. All SNR quantities are diagnostic. "
             "If detection is needed downstream, apply it on the empirical "

@@ -9,7 +9,9 @@ Run (tf_loc or any numpy+matplotlib env):
   python src/module_1_scene_gen/plot_deployment_from_csv.py \
       configs/gps_coordinates/boston_cambridge_street_bs3_lo10_tx_rx.csv \
       boston_cambridge_street
-Args: <csv_path> <scene_id>   (scene_id -> data/scenes/<scene_id>/building_footprints.npz)
+Args: <csv_path> <scene_id> [buffer_m]
+The optional buffer selects a matching cache; omit to use legacy footprints
+or a unique cache. Supply it when the scene has multiple caches and no legacy file.
 Output: configs/gps_coordinates/<csv_stem_without _tx_rx>_tx_deployment.png
 """
 import os, sys, csv
@@ -43,7 +45,9 @@ def main():
     for b in bs:
         print(f"   {b['name']}: z={b['position'][2]:.0f} m")
 
-    polys = load_footprints(os.path.join(PD, "data", "scenes", scene_id))
+    buffer_m = float(sys.argv[3]) if len(sys.argv) > 3 else None
+    polys = load_footprints(os.path.join(PD, "data", "scenes", scene_id),
+                            buffer_m=buffer_m)
     print(f"buildings: {len(polys)}")
 
     stem = os.path.basename(csv_path).replace("_tx_rx.csv", "")

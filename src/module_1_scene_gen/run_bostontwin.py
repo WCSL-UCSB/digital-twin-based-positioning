@@ -400,6 +400,17 @@ def main(cfg: DictConfig):
     copied, rel_meshes, stats = _copy_native_artifacts(
         boston3d_dir, selected_id, target_dir,
     )
+    if "scene_generation" in cfg:
+        if __package__:
+            from .scene_run_record import record_generation
+        else:
+            from scene_run_record import record_generation
+        record_generation(cfg, target_dir, {
+            "source": "BostonTwin", "native_dataset_root": str(data_root),
+            "scene_center_projected_m": list(_load_scene_center_m(target_dir / f"{selected_id}_tileinfo.geojson")),
+            "mesh_corrections": stats,
+            "terrain": "native_BostonTwin_ground_frame",
+        })
     print(f"[Success] Copied native artifacts to {target_dir}:")
     for name in copied:
         print(f"   - {name}")

@@ -11,6 +11,11 @@ import json
 import time
 import shutil
 import hashlib
+import uuid
+import xml.etree.ElementTree as ET
+from zipfile import BadZipFile
+from importlib.metadata import version
+from string import Template
 import numpy as np
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -18,13 +23,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-import sionna
 from sionna.rt import (
     load_scene, Transmitter, Receiver, PlanarArray,
     RadioMaterial, PathSolver,
 )
 from configs.materials import apply_ground_materials
 from src.utils.dataset_io import write_sidecar
+from src.utils.scene_io import resolve_scene_path
 
 
 # ---------------------------------------------------------------------------
@@ -40,22 +45,54 @@ def load_devices_from_csv(csv_path):
     print(f"Loading devices from: {csv_path}")
     with open(csv_path, "r") as f:
         reader = csv.DictReader(f)
-        for row in reader:
+        names = set()
+        for line, row in enumerate(reader, start=2):
             dev = {
                 "name": row["name"],
                 "type": row["type"].strip().lower(),
                 "pos":  [float(row["x"]), float(row["y"]), float(row["z"])],
             }
-            if row.get("look_at_x") and row.get("look_at_y") and row.get("look_at_z"):
+            if not dev["name"].strip() or dev["name"] in names:
+                raise ValueError(f"CSV line {line}: device names must be nonempty and unique")
+            names.add(dev["name"])
+            if dev["type"] not in {"tx", "rx"}:
+                raise ValueError(f"CSV line {line}: device type must be tx or rx")
+            if not np.isfinite(dev["pos"]).all():
+                raise ValueError(f"CSV line {line}: position must be finite")
+            look = [row.get(f"look_at_{axis}", "") for axis in "xyz"]
+            present = [bool(value and value.strip()) for value in look]
+            if any(present) and not all(present):
+                raise ValueError(f"CSV line {line}: supply all three look_at coordinates or none")
+            if all(present):
                 dev["look_at"] = [
                     float(row["look_at_x"]),
                     float(row["look_at_y"]),
                     float(row["look_at_z"]),
                 ]
+                if not np.isfinite(dev["look_at"]).all() or dev["look_at"] == dev["pos"]:
+                    raise ValueError(f"CSV line {line}: look_at must be finite and differ from position")
             else:
                 dev["look_at"] = None
+            if dev["type"] == "rx" and dev["look_at"] is None:
+                raise ValueError(f"CSV line {line}: BS/RX '{dev['name']}' requires an explicit look_at target")
             devices.append(dev)
     return devices
+
+
+def _validate_trace_config(cfg):
+    """Reject settings incompatible with the scalar (RX, TX, path) output."""
+    if not np.isfinite(float(cfg.frequency)) or float(cfg.frequency) <= 0:
+        raise ValueError("frequency must be finite and positive")
+    rt = cfg.ray_tracing_params
+    if not rt.synthetic_array:
+        raise ValueError("path_gen requires synthetic_array=true")
+    if int(rt.get("batch_size", 50)) <= 0:
+        raise ValueError("batch_size must be positive")
+    for name in ("tx_array", "rx_array"):
+        arr = cfg[name]
+        if (int(arr.num_rows) != 1 or int(arr.num_cols) != 1
+                or str(arr.get("polarization", "V")) not in {"V", "H"}):
+            raise ValueError(f"{name} must use 1x1 elements and single polarization V or H")
 
 
 def apply_materials(scene, cfg):
@@ -115,6 +152,14 @@ def apply_materials(scene, cfg):
         "thickness",
     }
 
+    # Shared defaults cover materials introduced by either scene generator.
+    # Per-material overrides below take precedence.
+    for mat in scene.radio_materials.values():
+        for field, value in mat_cfg.get("defaults", {}).items():
+            if field not in _PATCHABLE:
+                raise ValueError(f"Unsupported material default: {field}")
+            setattr(mat, field, float(value))
+
     if "overrides" in mat_cfg:
         count = 0
         for key, props in mat_cfg.overrides.items():
@@ -153,7 +198,8 @@ def apply_materials(scene, cfg):
 # Checkpoint / shard helpers
 # ---------------------------------------------------------------------------
 # path_gen traces in batches and writes each group of batches to a shard .npz
-# under data/path_data/_shards/<scenario>/ as it goes. If the job is killed
+# under data/path_data/_shards/<scenario>/<fingerprint>/run_*/ as it goes.
+# If the job is killed
 # (walltime / OOM) before finishing, the completed shards survive on disk: they
 # can be merged into a (partial) dataset, and a resubmit RESUMES from the last
 # shard instead of retracing. On a clean finish the shards are merged into the
@@ -161,9 +207,12 @@ def apply_materials(scene, cfg):
 # Tune via a `checkpoint:` block in the scenario YAML:
 #   checkpoint:
 #     every_batches: 25     # shard cadence (<=0 -> one shard at the very end)
-#     resume: true          # reuse matching shards from a prior run
+#     resume: true          # resume newest run with identical trace inputs
+#                           # false creates an isolated fresh run
 #     keep_shards: false    # keep shards even after a complete merge
-# Recover/merge a dead run without retracing:  +finalize_only=true
+# Recover/merge the newest matching run without retracing: +finalize_only=true
+# Legacy shards directly under <scenario>/ cannot establish input identity and
+# are left untouched; they are never reused by the new fingerprint format.
 
 _PATH_KEYS = ["a", "tau", "theta_r", "phi_r", "theta_t", "phi_t",
               "interactions", "valid"]
@@ -192,43 +241,139 @@ def _merge_path_dicts(dicts, max_paths_global=None):
     return merged, max_paths_global
 
 
+def _file_digest(path):
+    """Hash file contents in bounded memory, including large scene meshes."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _scene_asset_digests(scene_path):
+    """Hash the XML, included XMLs, and their referenced meshes/textures.
+
+    Resolve filenames relative to their XML, including Mitsuba XML defaults.
+    Missing/unresolved assets fail closed rather than permit unsafe resume.
+    """
+    assets = {}
+
+    def visit(path, is_xml=False, defaults=None):
+        path = os.path.abspath(path)
+        if path in assets:
+            return
+        assets[path] = _file_digest(path)
+        if not is_xml:
+            return
+        root = ET.parse(path).getroot()
+        defaults = dict(defaults or {})
+        for node in root.iter("default"):
+            defaults.setdefault(node.attrib["name"], node.attrib["value"])
+        for node in root.iter():
+            if node.tag == "include":
+                filename = node.attrib["filename"]
+            elif node.tag == "string" and node.get("name") == "filename":
+                filename = node.attrib["value"]
+            else:
+                continue
+            # Defaults can refer to other defaults. A cycle stays unresolved.
+            for _ in range(len(defaults) + 1):
+                expanded = Template(filename).safe_substitute(defaults)
+                if expanded == filename:
+                    break
+                filename = expanded
+            if "$" in filename:
+                raise ValueError(f"Unresolved scene asset {filename!r} in {path}")
+            visit(os.path.join(os.path.dirname(path), filename),
+                  is_xml=node.tag == "include", defaults=defaults)
+
+    visit(scene_path, is_xml=True)
+    return assets
+
+
 def _run_fingerprint(solver_kwargs, num_tx, num_rx, batch_size,
-                     scenario_name, frequency, csv_path):
-    """Short hash identifying this trace configuration. Shards only resume/merge
-    when their fingerprint matches, so a config change can't silently mix data."""
+                     scenario_name, frequency, csv_path, *, scene_path, cfg):
+    """Identify actual trace inputs, independent of checkpoint cadence."""
     payload = {
+        "schema": 2,
         "solver_kwargs": dict(solver_kwargs),
         "num_tx": int(num_tx), "num_rx": int(num_rx),
         "batch_size": int(batch_size),
         "scenario_name": str(scenario_name),
         "frequency_hz": float(frequency),
-        "csv": os.path.basename(csv_path),
+        "csv_sha256": _file_digest(csv_path),
+        "scene_assets": _scene_asset_digests(scene_path),
+        "tx_array": OmegaConf.to_container(cfg.tx_array, resolve=True),
+        "rx_array": OmegaConf.to_container(cfg.rx_array, resolve=True),
+        "material_config": OmegaConf.to_container(cfg, resolve=True).get("material_config"),
+        "sionna_rt_version": version("sionna-rt"),
     }
-    s = json.dumps(payload, sort_keys=True, default=str)
-    return hashlib.md5(s.encode()).hexdigest()[:12]
+    # Ground overrides also depend on these local material curves/helpers.
+    material_dir = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                               "../../configs/materials"))
+    payload["material_files"] = {
+        os.path.relpath(path, material_dir): _file_digest(path)
+        for pattern in ("**/*.csv", "**/*.py")
+        for path in sorted(glob.glob(os.path.join(material_dir, pattern), recursive=True))
+    }
+    encoded = json.dumps(payload, sort_keys=True).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _select_shard_dir(shard_root, fingerprint, resume, finalize_only):
+    """Keep fresh runs isolated and resume the newest matching run only."""
+    family = os.path.join(shard_root, fingerprint)
+    runs = sorted(path for path in glob.glob(os.path.join(family, "run_*"))
+                  if os.path.isdir(path))
+    if (resume or finalize_only) and runs:
+        return runs[-1]
+    if finalize_only:
+        return os.path.join(family, "unstarted")  # no writes on a missing run
+    os.makedirs(family, exist_ok=True)
+    run = os.path.join(family, f"run_{time.time_ns():020d}_{uuid.uuid4().hex}")
+    os.mkdir(run)  # preserve the shared workspace's normal umask
+    return run
+
+
+def _matching_shards(shard_dir, fingerprint):
+    """Read matching ranges and reject overlap before skipping or merging."""
+    metas = []
+    for path in sorted(glob.glob(os.path.join(shard_dir, "shard_b*.npz"))):
+        try:
+            with np.load(path, allow_pickle=False) as data:
+                if str(data["fingerprint"]) != fingerprint:
+                    continue
+                meta = (int(data["bi_start"]), int(data["bi_end"]),
+                        int(data["tx_start"]), int(data["tx_end"]),
+                        int(data["local_max_paths"]), path)
+                if not (0 <= meta[0] < meta[1] and 0 <= meta[2] < meta[3]
+                        and meta[4] >= 0):
+                    raise ValueError("invalid batch/TX range")
+                metas.append(meta)
+        except (OSError, ValueError, KeyError, EOFError, BadZipFile) as ex:
+            print(f"[checkpoint] ignoring unreadable shard {os.path.basename(path)}: {ex}")
+    metas.sort(key=lambda m: m[0])
+    for previous, current in zip(metas, metas[1:]):
+        if current[0] < previous[1] or current[2] < previous[3]:
+            raise ValueError(
+                f"Overlapping checkpoint shards: {previous[5]} and {current[5]}. "
+                "Start a fresh run with checkpoint.resume=false.")
+    return metas
 
 
 def _scan_done_batches(shard_dir, fingerprint):
-    """Return the set of batch indices already covered by matching shards."""
-    done = set()
-    if not os.path.isdir(shard_dir):
-        return done
-    for f in sorted(glob.glob(os.path.join(shard_dir, "shard_b*.npz"))):
-        try:
-            d = np.load(f, allow_pickle=False)
-            if str(d["fingerprint"]) != fingerprint:
-                continue
-            for bi in range(int(d["bi_start"]), int(d["bi_end"])):
-                done.add(bi)
-        except Exception as ex:
-            print(f"[resume] ignoring unreadable shard "
-                  f"{os.path.basename(f)}: {ex}")
-    return done
+    """Return batch indices covered by matching, nonoverlapping shards."""
+    return {bi for start, end, *_ in _matching_shards(shard_dir, fingerprint)
+            for bi in range(start, end)}
 
 
 def _write_shard(shard_dir, bi_start, bi_end, tx_start, tx_end, buffer, fingerprint):
     """Atomically write one shard (a group of consecutive batches) to disk."""
+    if not buffer or len(buffer) != bi_end - bi_start:
+        raise ValueError("A shard must contain one result per consecutive batch")
     merged, local_max = _merge_path_dicts(buffer)
+    if any(value.shape[-2] != tx_end - tx_start for value in merged.values()):
+        raise ValueError("Shard TX range does not match its arrays")
     os.makedirs(shard_dir, exist_ok=True)
     name = f"shard_b{bi_start:05d}_b{bi_end:05d}.npz"
     final = os.path.join(shard_dir, name)
@@ -251,27 +396,21 @@ def _finalize_from_shards(shard_dir, fingerprint, output_dir, cfg, loc_id,
     """Merge the contiguous, fingerprint-matching shards into one *_paths.npz.
     Returns (filename, complete); complete is False when the shards only cover a
     TX prefix (an interrupted run) — that file is suffixed _partialNNNNN."""
-    files = sorted(glob.glob(os.path.join(shard_dir, "shard_b*.npz")))
-    metas = []
-    for f in files:
-        d = np.load(f, allow_pickle=False)
-        if str(d["fingerprint"]) != fingerprint:
-            continue
-        metas.append((int(d["bi_start"]), int(d["bi_end"]), int(d["tx_start"]),
-                      int(d["tx_end"]), int(d["local_max_paths"]), f))
+    metas = _matching_shards(shard_dir, fingerprint)
     if not metas:
         return None, False
-    metas.sort(key=lambda m: m[0])
 
     # Keep only the contiguous prefix starting at batch 0.
-    contig, expect = [], 0
+    contig, expect, expect_tx = [], 0, 0
     for m in metas:
         if m[0] != expect:
             print(f"[finalize] batch gap before {m[0]} (expected {expect}); "
                   f"merging the contiguous prefix only.")
             break
+        if m[2] != expect_tx or m[3] > num_tx:
+            raise ValueError(f"Inconsistent checkpoint TX range in {m[5]}")
         contig.append(m)
-        expect = m[1]
+        expect, expect_tx = m[1], m[3]
     if not contig:
         print("[finalize] no contiguous shards starting at batch 0.")
         return None, False
@@ -285,8 +424,8 @@ def _finalize_from_shards(shard_dir, fingerprint, output_dir, cfg, loc_id,
 
     dicts = []
     for (_, _, _, _, _, f) in contig:
-        d = np.load(f, allow_pickle=False)
-        dicts.append({k: d[k] for k in _PATH_KEYS})
+        with np.load(f, allow_pickle=False) as data:
+            dicts.append({k: data[k] for k in _PATH_KEYS})
     merged, _ = _merge_path_dicts(dicts, max_paths_global=global_max)
 
     assert merged["tau"].shape == (num_rx, num_tx_covered, global_max), (
@@ -329,7 +468,7 @@ def _finalize_from_shards(shard_dir, fingerprint, output_dir, cfg, loc_id,
         "partial":            (not complete),
         "max_paths":          int(global_max),
         "solver_kwargs":      solver_kwargs,
-        "sionna_version":     getattr(sionna, "__version__", "unknown"),
+        "sionna_version":     version("sionna-rt"),
         "config_snapshot":    OmegaConf.to_container(cfg, resolve=True),
         "interaction_type_codes": {
             "NONE": 0, "SPECULAR": 1, "DIFFUSE": 2,
@@ -340,7 +479,7 @@ def _finalize_from_shards(shard_dir, fingerprint, output_dir, cfg, loc_id,
     suffix = "" if complete else f"_partial{num_tx_covered:05d}of{num_tx:05d}"
     filename = os.path.join(
         output_dir,
-        f"{time.strftime('%Y%m%d_%H%M%S')}_{cfg.scenario_name}{suffix}_paths.npz",
+        f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}_{cfg.scenario_name}{suffix}_paths.npz",
     )
     print(f"\nSaving to {filename}")
     np.savez(
@@ -370,29 +509,40 @@ def _finalize_from_shards(shard_dir, fingerprint, output_dir, cfg, loc_id,
 def main(cfg: DictConfig):
     OmegaConf.resolve(cfg)
 
+    if cfg.get("deployment", {}).get("mode") == "pending":
+        raise ValueError("This config defines a scene only. Supply a named BS deployment and its device CSV before ray tracing.")
+
+    _validate_trace_config(cfg)
+
     loc_id      = cfg.selected_id
     project_dir = cfg.project_dir
     frequency   = float(cfg.frequency)
 
     # ---- GPS DB + CSV routing ----
-    gps_path = cfg.gps_location_path
+    gps_path = os.path.join(project_dir, cfg.gps_location_path)
     if os.path.isdir(gps_path):
         gps_path = os.path.join(gps_path, "gps_locations.yaml")
     gps_db = OmegaConf.load(gps_path)
 
     if loc_id in gps_db and "coordinate_file" in gps_db[loc_id]:
-        csv_path = gps_db[loc_id].coordinate_file.replace("${project_dir}", project_dir)
+        # Read without resolving against the GPS DB, which need not define project_dir.
+        entry = OmegaConf.to_container(gps_db[loc_id], resolve=False)
+        csv_path = os.path.join(project_dir, entry["coordinate_file"].replace("${project_dir}", project_dir))
     else:
         print(f"[Info] '{loc_id}' not in GPS database. Using default CSV routing.")
         yaml_dir = os.path.dirname(gps_path)
         csv_path = os.path.join(yaml_dir, f"{loc_id}_tx_rx.csv")
 
+    # Validate inputs before loading geometry or starting an expensive trace.
+    devices = load_devices_from_csv(csv_path)
+    tx_list = [d for d in devices if d["type"] == "tx"]
+    rx_list = [d for d in devices if d["type"] == "rx"]
+    num_tx, num_rx = len(tx_list), len(rx_list)
+    if not num_tx or not num_rx:
+        raise ValueError("Device CSV must contain at least one TX and one RX")
+
     # ---- Scene path ----
-    if "scene_xml_path" in cfg:
-        raw_path = cfg.scene_xml_path.replace("${project_dir}", project_dir)
-        scene_path = os.path.abspath(raw_path)
-    else:
-        scene_path = os.path.join(project_dir, "data", "scenes", loc_id, "scene.xml")
+    scene_path = resolve_scene_path(cfg)
     if not os.path.exists(scene_path):
         raise FileNotFoundError(f"Geometry not found: {scene_path}")
 
@@ -438,12 +588,6 @@ def main(cfg: DictConfig):
           f"pattern={rx_arr.get('pattern','iso')} pol={rx_arr.get('polarization','V')}")
 
     # ---- Devices ----
-    devices   = load_devices_from_csv(csv_path)
-    tx_list   = [d for d in devices if d["type"] == "tx"]
-    rx_list   = [d for d in devices if d["type"] == "rx"]
-    num_tx    = len(tx_list)
-    num_rx    = len(rx_list)
-
     print("\n--- Device Layout ---")
     print(f"TX: {num_tx}  |  RX: {num_rx}")
 
@@ -456,6 +600,9 @@ def main(cfg: DictConfig):
 
     # ---- PathSolver kwargs from config ----
     rt_cfg = cfg.ray_tracing_params
+    # This pipeline expects synthetic_array=True with one antenna per end.
+    # synthetic_array=False is unsupported: tau/angles retain antenna axes,
+    # while the downstream dataset format requires (RX, TX, path) tensors.
     solver_kwargs = dict(
         max_depth           = int(rt_cfg.max_depth),
         synthetic_array     = bool(rt_cfg.synthetic_array),
@@ -483,7 +630,7 @@ def main(cfg: DictConfig):
     # ---- Output + checkpoint setup ----
     output_dir = os.path.join(project_dir, "data", "path_data")
     os.makedirs(output_dir, exist_ok=True)
-    shard_dir = os.path.join(output_dir, "_shards", str(cfg.scenario_name))
+    shard_root = os.path.join(output_dir, "_shards", str(cfg.scenario_name))
 
     ckpt_cfg      = cfg.get("checkpoint", {}) or {}
     ckpt_every    = int(ckpt_cfg.get("every_batches", 25))
@@ -494,7 +641,9 @@ def main(cfg: DictConfig):
         ckpt_every = num_batches  # single shard flushed at the very end
 
     fingerprint = _run_fingerprint(solver_kwargs, num_tx, num_rx, batch_size,
-                                   cfg.scenario_name, frequency, csv_path)
+                                   cfg.scenario_name, frequency, csv_path,
+                                   scene_path=scene_path, cfg=cfg)
+    shard_dir = _select_shard_dir(shard_root, fingerprint, resume, finalize_only)
     print(f"Checkpoint shards -> {shard_dir}  "
           f"(every {ckpt_every} batch(es), fingerprint {fingerprint})")
 
@@ -513,6 +662,14 @@ def main(cfg: DictConfig):
             s = bi * batch_size
             e = min(s + batch_size, num_tx)
             if bi in done_batches:
+                # Never label batches on opposite sides of a saved range as
+                # one consecutive shard when filling holes during resume.
+                if buffer:
+                    _write_shard(shard_dir, buf_bi_start, buf_bi_end,
+                                 buf_bi_start * batch_size,
+                                 min(buf_bi_end * batch_size, num_tx),
+                                 buffer, fingerprint)
+                    buffer, buf_bi_start, buf_bi_end = [], None, None
                 print(f"  -> Batch {bi+1}/{num_batches}: TX {s+1}..{e}  [checkpointed, skip]")
                 continue
             chunk = tx_list[s:e]

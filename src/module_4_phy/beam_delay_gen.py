@@ -1,8 +1,8 @@
 # =============================================================================
-# bdp_gen.py — Beam-Delay Profile generation for CNN training
+# beam_delay_gen.py — Beam-Delay Profile generation for CNN training
 # =============================================================================
 #
-# Consumes the consolidated channel-taps .npz from channel_tap_gen.py and
+# Consumes the consolidated channel-taps .npz from channel_taps_gen.py and
 # produces complex beam-delay profiles (BDPs) per link plus a single
 # consolidated training dataset.
 #
@@ -14,11 +14,11 @@
 #   When num_rx == 1 (single-BS), the output is unchanged:
 #     ULA: Z shape = (num_positions, N_beams, Lh)
 #     UPA: Z shape = (num_positions, M, N_beams, Lh)
-#   Zero-padding is applied when a BS has no surviving paths to a position.
+#   A BS without surviving paths contributes zeros, regardless of the noise setting.
 #
-# Pipeline per link:
+# Pipeline per link with surviving paths:
 #   1. Cyclic-prefixed Zadoff-Chu pilot is transmitted through each element.
-#   2. Beamspace DFT across N columns (azimuth) and, if M > 1, M rows (elev).
+#   2. Add receiver noise, then beamspace DFT across columns and rows.
 #   3. Per-beam frequency-domain matched filter against ZC conjugate.
 #   4. Truncate to Lh delay bins → complex beam-delay profile.
 #
@@ -36,7 +36,13 @@ import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from src.utils.dataset_io import resolve_input, pinned, write_sidecar  # noqa: E402
+from src.utils.radio_power import diagnostic_gains, positive_int
+from src.utils.receiver_noise import recorded_noise_budget, link_noise_rng, complex_receiver_noise
+import json
+import math
 import time
+import uuid
+from datetime import datetime
 import numpy as np
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -55,15 +61,20 @@ load_dotenv()
 
 def gen_zadoff_chu(length, root):
     """Generate a Zadoff-Chu sequence of given length and root index."""
+    length = positive_int(length, "pilot length")
+    root = positive_int(root, "Zadoff-Chu root")
+    if length < 2 or root >= length or math.gcd(root, length) != 1:
+        raise ValueError("Zadoff-Chu root must be smaller than and coprime to its length")
     n = np.arange(length)
-    return np.exp(-1j * np.pi * root * n * (n + 1) / length)
+    return np.exp(-1j * np.pi * root * n * (n + length % 2) / length)
 
 
 # ---------------------------------------------------------------------------
 # BDP core (vectorized across elements)
 # ---------------------------------------------------------------------------
 
-def bdp_from_H(H, s_cp, S_conj, Lh, Lcp, Nseq):
+def bdp_from_H(H, s_cp, S_conj, Lh, Lcp, Nseq, *, noise_power_w=0.0,
+               rng=None, return_diagnostics=False):
     """
     Convert a channel-taps tensor to a complex beam-delay profile.
 
@@ -72,35 +83,50 @@ def bdp_from_H(H, s_cp, S_conj, Lh, Lcp, Nseq):
     H      : (M, N, T_fixed) complex — per-element channel taps
     s_cp   : (Lcp + Nseq,) complex — cyclic-prefixed ZC sequence
     S_conj : (Nseq,) complex — conj(FFT(s))
-    Lh     : int — output delay bins
+    Lh     : int — output delay bins, must equal the saved channel tap count
     Lcp    : int — cyclic prefix length
     Nseq   : int — training sequence length
+    noise_power_w : float — receiver noise power per complex antenna sample
+    rng : numpy.random.Generator — independent stream for this link
+    return_diagnostics : bool — also return mean per-element pilot/noise powers
 
     Returns
     -------
     Z : (M, N_beams, Lh) complex. For a ULA (M=1) the caller squeezes.
     """
+    if H.ndim != 3 or not all(H.shape) or not np.isfinite(H).all():
+        raise ValueError("H must be a nonempty, finite (M, N, taps) tensor")
     M, N, T_fixed = H.shape
+    if not 1 <= Lh <= Nseq or Lcp < Lh - 1 or len(s_cp) != Lcp + Nseq:
+        raise ValueError("Require 1 <= delay bins <= pilot length and a sufficient cyclic prefix")
+    if np.shape(S_conj) != (Nseq,):
+        raise ValueError("Pilot spectrum length does not match Nseq")
 
-    # Pad / truncate the tap axis to Lh
-    if T_fixed < Lh:
-        H_work = np.pad(H, ((0, 0), (0, 0), (0, Lh - T_fixed)))
-    elif T_fixed > Lh:
-        H_work = H[:, :, :Lh]
-    else:
-        H_work = H
+    # A BDP uses the complete saved channel; it cannot extend its physical
+    # delay window or silently discard echoes before pilot propagation.
+    if Lh != T_fixed:
+        raise ValueError(
+            f"BDP delay bins ({Lh}) must equal the channel tap count ({T_fixed}); "
+            "regenerate channel taps to change the delay window.")
 
     # ---- Step 1: FFT-based convolution across all elements at once ----
     conv_len = len(s_cp) + Lh - 1
     n_fft = 1 << int(np.ceil(np.log2(conv_len)))
 
     S_cp_f = np.fft.fft(s_cp, n=n_fft)
-    H_f    = np.fft.fft(H_work, n=n_fft, axis=-1)
+    H_f    = np.fft.fft(H, n=n_fft, axis=-1)
     Y_full = np.fft.ifft(H_f * S_cp_f[np.newaxis, np.newaxis, :],
                          n=n_fft, axis=-1)
 
     # Signal-settled window
     Y_ant = Y_full[:, :, Lcp:Lcp + Nseq]
+    signal_power_w = float(np.mean(np.abs(Y_ant)**2)) if return_diagnostics else None
+    measured_noise_w = 0.0
+    if noise_power_w != 0:
+        noise = complex_receiver_noise(Y_ant.shape, noise_power_w, rng)
+        if return_diagnostics:
+            measured_noise_w = float(np.mean(np.abs(noise)**2))
+        Y_ant = Y_ant + noise
 
     # ---- Step 2: beamspace DFT ----
     Y_beam = np.fft.fftshift(
@@ -118,7 +144,41 @@ def bdp_from_H(H, s_cp, S_conj, Lh, Lcp, Nseq):
                       n=Nseq, axis=-1)
 
     # ---- Step 4: truncate to Lh delay bins ----
-    return Z[:, :, :Lh]
+    result = Z[:, :, :Lh]
+    if return_diagnostics:
+        return result, {"signal_power_w": signal_power_w, "noise_power_w": measured_noise_w}
+    return result
+
+
+def _source_snr(ch_data, channel_meta, cfg):
+    """Use embedded diagnostics or the exact recorded calibration, never latest."""
+    required = ("snr_raw_db", "p_rx_total_dbm")
+    recorded = channel_meta.get("source_calibrated_npz")
+    explicit = pinned(cfg, "calibrated_npz")
+    if explicit and (not recorded or os.path.basename(explicit) != os.path.basename(recorded)):
+        raise ValueError("inputs.calibrated_npz does not match the channel's recorded calibration")
+    if all(key in ch_data.files for key in required):
+        return {key: ch_data[key] for key in required}, None, "embedded_channel_diagnostics"
+    if not recorded:
+        print("[Info] Channel has no recorded calibration; predicted SNR fields omitted.")
+        return {}, None, "unavailable"
+    path = explicit or os.path.join(str(cfg.project_dir), "data", "path_data",
+                                   "calibrated_paths", os.path.basename(recorded))
+    if not os.path.isfile(path):
+        if explicit:
+            raise FileNotFoundError(f"Pinned source calibration not found: {path}")
+        print(f"[Info] Recorded calibration unavailable: {path}; predicted SNR fields omitted.")
+        return {}, None, "unavailable"
+    with np.load(path, allow_pickle=True) as calibrated:
+        expected_meta = channel_meta.get("source_metadata")
+        if expected_meta is None or json.dumps(calibrated["metadata"].item(), sort_keys=True,
+                                               default=str) != json.dumps(expected_meta, sort_keys=True,
+                                                                          default=str):
+            raise ValueError("Recorded calibration metadata does not match the channel source")
+        for key in ("tx_names", "rx_names", "tx_pos", "rx_pos"):
+            if key not in calibrated.files or not np.array_equal(calibrated[key], ch_data[key]):
+                raise ValueError(f"Recorded calibration {key} does not match channel device order/layout")
+        return {key: calibrated[key] for key in required}, path, "recorded_calibration"
 
 
 # ---------------------------------------------------------------------------
@@ -236,44 +296,81 @@ def main(cfg: DictConfig):
     tx_names    = ch_data["tx_names"]
     rx_names    = ch_data["rx_names"]
 
+    if H_all.ndim != 5 or not all(H_all.shape):
+        raise ValueError("H must have nonempty (RX, TX, M, N, taps) axes")
     num_rx, num_tx, M, N, T_fixed = H_all.shape
+    link_shape = (num_rx, num_tx)
+    if (num_paths.shape != link_shape or not np.issubdtype(num_paths.dtype, np.integer)
+            or np.any(num_paths < 0)):
+        raise ValueError("num_paths must be nonnegative integers with shape (RX, TX)")
+    if is_los_kept.shape != link_shape or is_los_kept.dtype != np.bool_:
+        raise ValueError("is_los_kept must be a boolean (RX, TX) array")
+    if np.any(is_los_kept & (num_paths == 0)):
+        raise ValueError("An empty link cannot be marked is_los_kept")
+    for name, value, shape in (("shift_applied", shift_ns, link_shape),
+                               ("tx_pos", tx_pos, (num_tx, 3)), ("rx_pos", rx_pos, (num_rx, 3))):
+        if value.shape != shape or not np.isfinite(value).all():
+            raise ValueError(f"{name} must have shape {shape} and finite values")
+    if tx_names.shape != (num_tx,) or rx_names.shape != (num_rx,):
+        raise ValueError("Device names must agree with the channel tensor axes")
     K = num_rx  # number of base stations
 
-    # ---- Optional SNR pass-through ----
-    calib_dir = os.path.join(project_dir, "data", "path_data", "calibrated_paths")
-    calib_file = resolve_input(
-        os.path.join(calib_dir, f"*_calibrated_{cfg.scenario_name}.npz"),
-        pinned(cfg, "calibrated_npz"), label="calibrated paths (SNR pass-through)",
-        required=False)
-    if calib_file is not None:
-        calib_data = np.load(calib_file, allow_pickle=True)
-        snr_raw_db      = calib_data["snr_raw_db"]       # (R, T)
-        snr_bf_db       = calib_data["snr_bf_db"]         # (R, T)
-        snr_detector_db = calib_data["snr_detector_db"]   # (R, T)
-        p_rx_total_dbm  = calib_data["p_rx_total_dbm"]    # (R, T)
-        has_snr = True
+    # The saved channel determines both the BDP length and cyclic prefix.
+    # A current config value is a consistency check, not a resizing request.
+    Lh = positive_int(T_fixed, "saved channel tap count")
+    configured_taps = cfg.training_sequence.get("max_delay_bins")
+    if configured_taps is not None:
+        configured_taps = positive_int(configured_taps, "training_sequence.max_delay_bins")
+        if configured_taps != Lh:
+            raise ValueError(
+                f"training_sequence.max_delay_bins={configured_taps}, but the saved "
+                f"channel has {Lh} taps. Restore max_delay_bins={Lh} or regenerate "
+                "channel taps from calibrated paths before BDP generation.")
+
+    # Original noise budget belongs to H; current YAML cannot silently replace it.
+    noise_cfg = cfg.get("receiver_noise", {}) or {}
+    noise_enabled = bool(noise_cfg.get("enabled", True))
+    noise_seed = noise_cfg.get("seed", 71)
+    link_noise_rng(noise_seed, "validation", "validation")  # validate even for empty datasets
+    if noise_enabled:
+        noise_power_w, noise_bandwidth, noise_dt = recorded_noise_budget(channel_meta)
+        if len(set(map(str, tx_names))) != num_tx or len(set(map(str, rx_names))) != num_rx:
+            raise ValueError("Unique TX/RX names are required for independent noise streams")
     else:
-        print("[Info] No calibrated .npz found; SNR fields will be absent.")
-        snr_raw_db = snr_bf_db = snr_detector_db = p_rx_total_dbm = None
-        has_snr = False
+        noise_power_w, noise_bandwidth, noise_dt = 0.0, None, channel_meta.get("dt_s")
+
+    # Prefer diagnostics saved with H; legacy files follow their exact source.
+    snr_data, calib_file, snr_source = _source_snr(ch_data, channel_meta, cfg)
+    has_snr = bool(snr_data)
+    if has_snr:
+        for key, value in snr_data.items():
+            if value.shape != (num_rx, num_tx):
+                raise ValueError(f"{key} shape does not match channel device layout")
+        snr_raw_db = snr_data["snr_raw_db"]
+        p_rx_total_dbm = snr_data["p_rx_total_dbm"]
 
     # ---- Training sequence ----
     seq_type = str(cfg.training_sequence.type).strip().lower()
-    Nseq = int(cfg.training_sequence.length)
-    Lh   = int(cfg.training_sequence.max_delay_bins)
+    Nseq = positive_int(cfg.training_sequence.length, "pilot length")
+    if Lh > Nseq:
+        raise ValueError("Saved channel tap count must not exceed pilot length")
     Lcp = Lh - 1
+    array_gain_db, processing_gain_db = diagnostic_gains(M, N, Nseq)
+    if has_snr:
+        snr_bf_db = snr_raw_db + array_gain_db
+        snr_detector_db = snr_bf_db + processing_gain_db
 
     if seq_type == "zadoff_chu":
-        root = int(cfg.training_sequence.root_index)
+        root = positive_int(cfg.training_sequence.root_index, "Zadoff-Chu root")
         s = gen_zadoff_chu(Nseq, root)
     else:
         raise ValueError(f"Unknown training sequence type: '{seq_type}'")
 
-    s_cp   = np.concatenate([s[-Lcp:], s])
+    s_cp   = np.concatenate([s[-Lcp:], s]) if Lcp else s.copy()
     S_conj = np.conj(np.fft.fft(s, n=Nseq))
 
     # ---- Labels ----
-    label_dim = int(cfg.training_sequence.get("label_dim", 2))
+    label_dim = positive_int(cfg.training_sequence.get("label_dim", 2), "label_dim")
     if label_dim not in (2, 3):
         raise ValueError(f"label_dim must be 2 or 3, got {label_dim}")
 
@@ -288,6 +385,8 @@ def main(cfg: DictConfig):
     print(f"Total links  : {num_rx * num_tx}")
     print(f"Label dim    : {label_dim}D")
     print(f"Output dtype : complex64 (log conversion deferred to training)")
+    print(f"Receiver noise: {'enabled' if noise_enabled else 'disabled'}, "
+          f"power={noise_power_w:.6g} W/element, seed={noise_seed}")
 
     # ================================================================
     #  Coverage analysis & dataset allocation
@@ -312,7 +411,7 @@ def main(cfg: DictConfig):
     if multi_bs:
         for r in range(K):
             n_zeropad = int(has_any_bs.sum() - (num_paths[r] > 0).sum())
-            print(f"  {rx_names[r]:12s}: {n_zeropad} positions will be zero-padded")
+            print(f"  {rx_names[r]:12s}: {n_zeropad} positions will be zero-filled")
 
     # Allocate output arrays
     if multi_bs:
@@ -333,6 +432,8 @@ def main(cfg: DictConfig):
     is_los_out    = np.zeros((n_positions, K), dtype=bool)
     shift_ns_out  = np.zeros((n_positions, K), dtype=np.float32)
     has_paths_out = np.zeros((n_positions, K), dtype=bool)
+    pilot_signal_power_w = np.zeros((n_positions, K), dtype=np.float64)
+    realized_noise_power_w = np.zeros((n_positions, K), dtype=np.float64)
 
     if has_snr:
         snr_raw_out = np.zeros((n_positions, K), dtype=np.float32)
@@ -348,8 +449,8 @@ def main(cfg: DictConfig):
     # ================================================================
     #  Compute BDPs directly into Z_all (no per-link intermediate buffer)
     # ================================================================
-    # Zero-padding for "this BS does not see this position" is free: Z_all
-    # is already zero-initialized, so we just skip those (r, t) pairs.
+    # For every retained position, a BS with no channel paths keeps its zero
+    # profile and power diagnostics. Noise is generated only for covered links.
     n_generated = 0
     t0 = time.time()
 
@@ -373,14 +474,22 @@ def main(cfg: DictConfig):
                 p_rx_out[out_idx, r]    = float(p_rx_total_dbm[r, t])
 
             if not has:
-                continue  # zero-fill already done at Z_all allocation
+                continue
 
             H = H_all[r, t].astype(np.complex128)
-            Z = bdp_from_H(H, s_cp, S_conj, Lh, Lcp, Nseq)
+            rng = link_noise_rng(noise_seed, tx_names[t], rx_names[r]) if noise_enabled else None
+            Z, powers = bdp_from_H(H, s_cp, S_conj, Lh, Lcp, Nseq,
+                                  noise_power_w=noise_power_w, rng=rng,
+                                  return_diagnostics=True)
+            pilot_signal_power_w[out_idx, r] = powers["signal_power_w"]
+            realized_noise_power_w[out_idx, r] = powers["noise_power_w"]
             if M == 1:
                 Z = Z[0]  # (N, Lh)
 
-            Z_c64 = Z.astype(np.complex64)
+            with np.errstate(over="ignore", invalid="ignore"):
+                Z_c64 = Z.astype(np.complex64)
+            if not np.isfinite(Z_c64).all():
+                raise ValueError(f"Nonfinite BDP at RX[{r}], TX[{t}]; check channel amplitudes")
             if multi_bs:
                 Z_all[out_idx][..., r] = Z_c64
             else:
@@ -418,7 +527,9 @@ def main(cfg: DictConfig):
     # ---- Save ----
     out_dir = os.path.join(project_dir, "data", "ml_datasets", cfg.scenario_name)
     os.makedirs(out_dir, exist_ok=True)
-    stamp = time.strftime("%Y%m%d_%H%M%S")
+    # Retain the timestamp prefix used by dataset discovery; give every run
+    # its own dataset, sidecar, and plot names, including concurrent runs.
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f") + "_" + uuid.uuid4().hex[:8]
     ds_file = os.path.join(out_dir, f"{stamp}_bdp_dataset_{cfg.scenario_name}.npz")
 
     # Z axes description
@@ -436,7 +547,29 @@ def main(cfg: DictConfig):
     dataset_meta = {
         "source_channels_npz":   os.path.basename(ch_file),
         "source_channels_meta":  channel_meta,
-        "source_calibrated_npz": os.path.basename(calib_file) if calib_file else None,
+        "source_calibrated_npz": channel_meta.get("source_calibrated_npz"),
+        "snr_source": snr_source,
+        "snr_kind": "incoherent_path_power_with_ideal_processing_gains",
+        "diagnostic_gains": {"array_gain_db": array_gain_db,
+                             "processing_gain_db": processing_gain_db},
+        "beam_transform": "unitary negative-exponent DFT across columns and rows, fftshift",
+        "correlation_normalization": "unnormalized circular pilot correlation; noiseless Z = pilot_length * beamspace(H)",
+        "noise_power_w_per_complex_output_bin": Nseq * noise_power_w,
+        "output_noise_power_scope": "links with has_paths=true; zero for missing links",
+        "receiver_noise": {
+            "enabled": noise_enabled, "model": "independent_complex_white_gaussian",
+            "noise_power_w_per_element": noise_power_w,
+            "bandwidth_hz": noise_bandwidth, "dt_s": noise_dt,
+            "seed": int(noise_seed),
+            "stream": "PCG64/SeedSequence(seed,SHA256(JSON[tx_name,rx_name]))",
+            "injection_point": "received antenna pilot samples before beamforming",
+            "missing_link": "zero",
+            "applied_to": "links with num_paths > 0",
+        },
+        "power_diagnostics": {
+            "pilot_signal_power_w": "clean pilot power averaged over samples and antenna elements",
+            "realized_noise_power_w": "generated noise power averaged over samples and antenna elements; zero for missing links",
+        },
         "training_sequence": {
             "type":   seq_type,
             "length": Nseq,
@@ -458,13 +591,15 @@ def main(cfg: DictConfig):
                              for r in range(K)},
         "zero_padded":      {str(rx_names[r]): int((~has_paths_out[:, r]).sum())
                              for r in range(K)},
+        "noise_only":       {str(rx_names[r]): 0
+                             for r in range(K)},
         "Z_dtype":          "complex64",
         "Z_axes":           z_axes_str,
         "filtering_note": (
             "Only 'at least one BS has surviving paths' filter applied. "
-            "Positions not visible from a BS are zero-padded in that BS's "
-            "channel. Per-sample per-BS metadata is stored so downstream "
-            "training code can filter or weight without regenerating."
+            "A BS without surviving paths contributes zeros; no noise is generated "
+            "for that link. Per-sample per-BS metadata lets "
+            "training code filter or weight without regenerating."
         ),
         "preprocessing_note": (
             "Z is the CANONICAL complex beam-delay profile. Log-magnitude "
@@ -478,6 +613,8 @@ def main(cfg: DictConfig):
         "Z":             Z_all,
         "Y":             Y_all,
         "has_paths":     has_paths_out,       # (n_positions, K) bool
+        "pilot_signal_power_w": pilot_signal_power_w,
+        "realized_noise_power_w": realized_noise_power_w,
         "is_los_kept":   is_los_out,          # (n_positions, K) bool
         "shift_ns":      shift_ns_out,        # (n_positions, K) float32
         "tx_idx":        tx_idx_out,           # (n_positions,) int32
@@ -493,7 +630,10 @@ def main(cfg: DictConfig):
         save_dict["snr_detector_db"] = snr_det_out       # (n_positions, K)
         save_dict["p_rx_total_dbm"]  = p_rx_out          # (n_positions, K)
 
-    np.savez(ds_file, **save_dict)
+    # Exclusive creation prevents even an unlikely name collision overwriting
+    # another run. Pass the handle so np.savez cannot reopen/truncate the path.
+    with open(ds_file, "xb") as output:
+        np.savez(output, **save_dict)
     print(f"\nSaved: {ds_file}")
     write_sidecar(ds_file, stage="beam_delay_gen", cfg=cfg,
                   inputs={"channels_npz": ch_file, "calibrated_npz": calib_file},

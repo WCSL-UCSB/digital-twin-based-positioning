@@ -16,14 +16,17 @@
 #   omega_v = 2*pi * d_v_wl * sin(theta_el)
 #
 # Per-element delay offset (row m, column n, centered indices):
-#   delta_tau = (n*d_h_phys*cos(theta_el)*sin(theta_az)
-#              + m*d_v_phys*sin(theta_el)) / c
+#   delta_tau = -(n*d_h_phys*cos(theta_el)*sin(theta_az)
+#               + m*d_v_phys*sin(theta_el)) / c
+# Arrival directions point toward the source/last interaction: elements
+# displaced toward it receive the wave earlier (negative delay offset).
 # =============================================================================
 
 import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from src.utils.dataset_io import resolve_input, pinned, write_sidecar  # noqa: E402
+from src.utils.path_classification import LOS_CLASSIFICATION, los_from_interactions
 import time
 import numpy as np
 import hydra
@@ -54,16 +57,23 @@ def build_rotation_matrix(pos, look_at):
     """
     pos = np.asarray(pos, dtype=float)
     look_at = np.asarray(look_at, dtype=float)
+    if (pos.shape != (3,) or look_at.shape != (3,)
+            or not np.isfinite(pos).all() or not np.isfinite(look_at).all()):
+        raise ValueError("Receiver position and look_at must be finite 3D points")
 
     x_local = look_at - pos
-    x_local = x_local / np.linalg.norm(x_local)
+    norm = np.linalg.norm(x_local)
+    if norm == 0 or not np.isfinite(norm):
+        raise ValueError("Receiver look_at must differ from its position")
+    x_local = x_local / norm
 
     z_world = np.array([0.0, 0.0, 1.0])
     y_local = np.cross(z_world, x_local)
 
-    if np.linalg.norm(y_local) < 1e-6:
+    if np.linalg.norm(y_local) == 0.0:
         # Degenerate: x_local is (anti)parallel to world-z. Pick any seed
-        # and Gram-Schmidt it against x_local.
+        # and Gram-Schmidt it against x_local. For any nonzero horizontal
+        # projection, retain its azimuth, matching the tracer's look_at yaw.
         y_local = np.array([0.0, 1.0, 0.0])
 
     # Gram-Schmidt: remove component along x_local, then normalize.
@@ -121,8 +131,15 @@ def compute_element_delays_ns(theta_az, theta_el, M, N, d_h_wl, d_v_wl, frequenc
         n = column index, 0..N-1, centered so n' = n - (N-1)/2
         m = row index,    0..M-1, centered so m' = m - (M-1)/2
 
-    delta_tau[m, n, p] = (n' * d_h_phys * cos(theta_el_p) * sin(theta_az_p)
-                        + m' * d_v_phys * sin(theta_el_p)) / c
+    delta_tau[m, n, p] = -(n' * d_h_phys * cos(theta_el_p) * sin(theta_az_p)
+                         + m' * d_v_phys * sin(theta_el_p)) / c
+
+    The arrival unit vector points from the RX toward the source/last
+    interaction. In the plane-wave approximation, moving an element toward
+    that direction shortens its path: delta_tau = -dot(offset, direction)/c.
+    Thus exp(-j*2*pi*f*delta_tau) agrees with the positive spatial steering
+    phase used downstream. Offsets are relative to the array center and
+    may be negative, including for the earliest surviving path.
 
     Returns
     -------
@@ -142,7 +159,7 @@ def compute_element_delays_ns(theta_az, theta_el, M, N, d_h_wl, d_v_wl, frequenc
     horiz = d_h_phys * np.outer(n_idx, cos_el * sin_az)  # (N, P)
     vert = d_v_phys * np.outer(m_idx, sin_el)            # (M, P)
 
-    delta_tau_s = (vert[:, np.newaxis, :] + horiz[np.newaxis, :, :]) / speed_of_light
+    delta_tau_s = -(vert[:, np.newaxis, :] + horiz[np.newaxis, :, :]) / speed_of_light
     return delta_tau_s * 1e9  # -> ns
 
 
@@ -156,8 +173,13 @@ def resolve_frequency(cfg, meta_frequency_hz):
     frequency, assert it matches (within 1 Hz). Drift here is a silent
     killer of downstream phase math, so we fail loudly.
     """
+    meta_frequency_hz = float(meta_frequency_hz)
+    if not np.isfinite(meta_frequency_hz) or meta_frequency_hz <= 0:
+        raise ValueError("Raw-path frequency must be finite and positive")
     if "frequency" in cfg:
         cfg_freq = float(cfg.frequency)
+        if not np.isfinite(cfg_freq) or cfg_freq <= 0:
+            raise ValueError("Config frequency must be finite and positive")
         if abs(cfg_freq - meta_frequency_hz) > 1.0:
             raise ValueError(
                 f"Frequency mismatch: config says {cfg_freq:.6g} Hz, "
@@ -165,6 +187,22 @@ def resolve_frequency(cfg, meta_frequency_hz):
                 "Regenerate paths or fix the config."
             )
     return float(meta_frequency_hz)
+
+
+def validate_array_geometry(arr):
+    """Check panel dimensions, wavelength spacings and full FoV widths."""
+    for key in ("num_rows", "num_cols"):
+        value = float(arr[key])
+        if not np.isfinite(value) or value < 1 or not value.is_integer():
+            raise ValueError(f"rx_array_geometry.{key} must be a positive integer")
+    for key in ("horizontal_spacing", "vertical_spacing"):
+        value = float(arr.get(key, 0.5))
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(f"rx_array_geometry.{key} must be finite and positive")
+    for key, maximum in (("fov_az_deg", 360), ("fov_el_deg", 180)):
+        value = float(arr[key])
+        if not np.isfinite(value) or not 0 < value <= maximum:
+            raise ValueError(f"rx_array_geometry.{key} must be in (0, {maximum}] degrees")
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +215,7 @@ def main(cfg: DictConfig):
     project_dir = cfg.project_dir
 
     # ---- Array geometry from config ----
+    validate_array_geometry(cfg.rx_array_geometry)
     M = int(cfg.rx_array_geometry.num_rows)
     N = int(cfg.rx_array_geometry.num_cols)
     d_h_wl = float(cfg.rx_array_geometry.get("horizontal_spacing", 0.5))
@@ -187,7 +226,7 @@ def main(cfg: DictConfig):
     fov_az_rad = np.radians(fov_az_deg)
     fov_el_rad = np.radians(fov_el_deg)
 
-    array_type = "UPA" if M > 1 else "ULA"
+    array_type = "UPA" if M > 1 and N > 1 else "ULA"
 
     # ---- Load traced paths ----
     path_dir = os.path.join(project_dir, "data", "path_data")
@@ -217,9 +256,10 @@ def main(cfg: DictConfig):
     phi_t_3d   = data["phi_t"]
     num_valid  = data["num_valid_paths"]  # (num_rx, num_tx) int
 
-    # Per-bounce interaction types (path classification). Optional: only present
-    # if path_gen.py captured it. Shape (max_depth, num_rx, num_tx, max_paths).
-    inter_4d   = data["interactions"] if "interactions" in data.files else None
+    # Required to distinguish unobstructed direct paths from transmissions
+    # and short reflections, which can share the straight-line travel time.
+    inter_4d = data["interactions"] if "interactions" in data.files else None
+    los_from_interactions(inter_4d, num_valid)  # validate before filtering
 
     rx_names   = data["rx_names"]
     rx_pos     = data["rx_pos"]
@@ -227,14 +267,29 @@ def main(cfg: DictConfig):
     tx_names   = data["tx_names"]
 
     num_rx, num_tx, max_paths_in = tau_ns_3d.shape
-    assert a_3d.shape == (num_rx, num_tx, max_paths_in)
-    assert num_valid.shape == (num_rx, num_tx)
+    if not num_rx or not num_tx:
+        raise ValueError("Raw paths must contain at least one RX and one TX")
+    for key, values in (("a", a_3d), ("theta_r", theta_r_3d), ("phi_r", phi_r_3d),
+                        ("theta_t", theta_t_3d), ("phi_t", phi_t_3d)):
+        if values.shape != tau_ns_3d.shape:
+            raise ValueError(f"Raw {key} shape must match tau_ns")
+    if (num_valid.shape != (num_rx, num_tx)
+            or inter_4d.shape[1:] != tau_ns_3d.shape):
+        raise ValueError("Raw counts/interactions must match the delay tensor")
+    for prefix, count in (("rx", num_rx), ("tx", num_tx)):
+        if (data[f"{prefix}_names"].shape != (count,)
+                or data[f"{prefix}_pos"].shape != (count, 3)
+                or data[f"{prefix}_look_at"].shape != (count, 3)):
+            raise ValueError(f"Raw {prefix} device tables do not match the path axes")
+        if not np.isfinite(data[f"{prefix}_pos"]).all():
+            raise ValueError(f"Raw {prefix} positions must be finite")
 
     n_links_traced    = int((num_valid > 0).sum())
     n_total_links     = num_rx * num_tx
     print(f"Links with any traced paths:     {n_links_traced} / {n_total_links} "
         f"({100*n_links_traced/n_total_links:.1f}%)")
-    print(f"Mean paths per traced link:      {num_valid[num_valid>0].mean():.2f}")
+    mean_paths = float(num_valid[num_valid > 0].mean()) if n_links_traced else 0.0
+    print(f"Mean paths per traced link:      {mean_paths:.2f}")
     print(f"Max paths on any link:           {int(num_valid.max())}")
 
     # ---- Output accumulators (shape-preserving with a new path axis) ----
@@ -264,10 +319,10 @@ def main(cfg: DictConfig):
 
     for r in range(num_rx):
         look = rx_look_at[r]
-        if np.any(np.isnan(look)):
-            print(f"[Warning] RX '{rx_names[r]}' has no look_at; skipping.")
-            continue
-
+        if not np.isfinite(look).all():
+            raise ValueError(
+                f"BS/RX '{rx_names[r]}' requires an explicit, finite look_at target. "
+                "Update the deployment CSV and regenerate raw paths.")
         R = build_rotation_matrix(rx_pos[r], look)
         R_rx_all[r] = R
         bs_gcs = R[:, 0]
@@ -284,6 +339,11 @@ def main(cfg: DictConfig):
 
             if nv == 0:
                 continue
+            for values in (a_3d, tau_ns_3d, theta_r_3d, phi_r_3d, theta_t_3d, phi_t_3d):
+                if not np.isfinite(values[r, t, :nv]).all():
+                    raise ValueError(f"Nonfinite valid path data at RX {r}, TX {t}")
+            if np.any(tau_ns_3d[r, t, :nv] < 0):
+                raise ValueError(f"Negative raw delay at RX {r}, TX {t}")
             stage_counts["traced"] += 1
 
             # Only the first nv entries along the path axis are meaningful.
@@ -345,8 +405,7 @@ def main(cfg: DictConfig):
     print(f"\nMax surviving paths per link: {max_paths_out}")
 
     if max_paths_out == 0:
-        print("[ERROR] No paths survived filtering for any link.")
-        return
+        raise ValueError("No paths survived filtering for any link; no refined dataset written")
 
     shape_3d = (num_rx, num_tx, max_paths_out)
     tau_ns_out        = np.zeros(shape_3d, dtype=np.float64)
@@ -364,14 +423,11 @@ def main(cfg: DictConfig):
         (num_rx, num_tx, M, N, max_paths_out), dtype=np.float64
     )
 
-    # Carry interaction types through the filter (if captured upstream).
-    if inter_4d is not None:
-        max_depth = inter_4d.shape[0]
-        interactions_out = np.zeros(
-            (max_depth, num_rx, num_tx, max_paths_out), dtype=np.int16
-        )
-    else:
-        interactions_out = None
+    # Preserve interactions for every surviving path.
+    max_depth = inter_4d.shape[0]
+    interactions_out = np.zeros(
+        (max_depth, num_rx, num_tx, max_paths_out), dtype=np.int16
+    )
 
     for r in range(num_rx):
         for t in range(num_tx):
@@ -408,8 +464,10 @@ def main(cfg: DictConfig):
             phi_t_out[r, t, :k]    = phi_t_3d[r, t, idx]
             min_delay_ns_out[r, t] = min_delay_ns
             tau_per_element_ns_out[r, t, :, :, :k] = tau_per_el_ns
-            if interactions_out is not None:
-                interactions_out[:, r, t, :k] = inter_4d[:, r, t, idx]
+            interactions_out[:, r, t, :k] = inter_4d[:, r, t, idx]
+
+    # The label describes paths surviving the RX field-of-view filter.
+    is_los_kept = los_from_interactions(interactions_out, num_kept)
 
     # ---- Verification print ----
     print("\n" + "=" * 70)
@@ -441,7 +499,7 @@ def main(cfg: DictConfig):
     # ---- Save as .npz (consistent with path_gen.py) ----
     output_dir = os.path.join(project_dir, "data", "path_data", "refined_paths")
     os.makedirs(output_dir, exist_ok=True)
-    stamp = time.strftime("%Y%m%d_%H%M%S")
+    stamp = f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}"
     out_file = os.path.join(
         output_dir, f"{stamp}_filtered_{cfg.scenario_name}.npz"
     )
@@ -458,6 +516,11 @@ def main(cfg: DictConfig):
             "fov_el_deg": fov_el_deg,
         },
         "angle_convention": "true_spherical_broadside",
+        "delay_reference": "earliest_surviving_path_at_array_center",
+        "rx_orientation_policy": "explicit_look_at_required",
+        "link_survival_counts": stage_counts,
+        "los_classification": LOS_CLASSIFICATION,
+        "element_delay_convention": "delta_tau=-dot(element_offset,arrival_direction)/c",
         "units": {
             "tau_ns": "ns",
             "tau_per_element_ns": "ns",
@@ -466,13 +529,9 @@ def main(cfg: DictConfig):
             "omega_h": "rad",
             "omega_v": "rad",
         },
-        "polarization_traced": metadata.get("polarization_traced", "V"),
+        "polarization_traced": metadata.get("rx_array", {}).get(
+            "polarization", metadata.get("polarization_traced", "unknown")),
     }
-
-    # Optional: interaction types carried through the filter.
-    extra_arrays = {}
-    if interactions_out is not None:
-        extra_arrays["interactions"] = interactions_out
 
     print(f"\nSaving to {out_file}")
     np.savez(
@@ -500,8 +559,8 @@ def main(cfg: DictConfig):
         tx_look_at          = data["tx_look_at"],
         # metadata
         metadata            = filter_metadata,
-        # optional extras (e.g. interactions, if captured upstream)
-        **extra_arrays,
+        interactions        = interactions_out,
+        is_los_kept         = is_los_kept,
     )
     write_sidecar(out_file, stage="filter_and_adjust_paths", cfg=cfg,
                   inputs={"paths_npz": npz_file}, summary=filter_metadata)

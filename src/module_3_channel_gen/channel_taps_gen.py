@@ -1,5 +1,5 @@
 # =============================================================================
-# channel_tap_gen.py — Convert calibrated paths to first-arrival-referenced taps
+# channel_taps_gen.py — Convert calibrated paths to first-arrival-referenced taps
 # =============================================================================
 #
 # Consumes the calibrated .npz from apply_link_budget.py and produces a
@@ -11,17 +11,16 @@
 # Time reference convention:
 #     tau = 0  ≡  arrival time of the earliest surviving path of the link
 #
-# Rationale: the earliest-arrival instant is the only time reference a real
-# receiver can form without knowing its own position. The previous geometric
-# LoS reference (tau_los = ||tx-rx||/c) is computed from the true TX/RX
-# positions, so baking it into the delay axis is not inference-realizable and,
-# for NLoS-only links, leaks the straight-line range via the first-arrival
-# offset. We therefore keep the filter's min-normalized frame as-is.
+# This models ideal alignment to the first retained arrival; synchronization
+# and detectability of that path are not simulated here. A geometric-LoS
+# reference (tau_los = ||tx-rx||/c) uses true TX/RX positions, so using that
+# reference for the tap axis would introduce unavailable position information.
+# We keep the filter's min-normalized frame as-is.
 #
 # The per-link geometric LoS time and the NLoS first-arrival excess
 # (shift_applied = min_delay - tau_los, snapped/clamped) are still COMPUTED and
-# SAVED as diagnostics — the boolean flag `is_los_kept[r, t]` lets downstream
-# code distinguish the two regimes — but the excess is no longer added to the
+# SAVED as diagnostics. The upstream interaction-based `is_los_kept[r, t]`
+# distinguishes the two regimes — but the excess is not added to the
 # taps.
 # =============================================================================
 
@@ -29,6 +28,8 @@ import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from src.utils.dataset_io import resolve_input, pinned, write_sidecar  # noqa: E402
+from src.utils.radio_power import positive_float, positive_int
+from src.utils.path_classification import LOS_CLASSIFICATION, los_from_interactions
 import time
 import numpy as np
 import hydra
@@ -38,14 +39,13 @@ from scipy.constants import speed_of_light
 
 load_dotenv()
 
-# Tolerance (ns) for deciding whether the filter kept the LoS path.
-# 1 ns corresponds to ~30 cm of path length — well within reflection-vs-LoS
-# discrimination for urban canyon geometry.
-LOS_TOL_NS = 0.5
+# Tolerance only for diagnosing arrivals earlier than straight-line travel.
+# LoS labels come from surviving path interactions, never from this tolerance.
+DELAY_TOL_NS = 0.5
 
 
 # ---------------------------------------------------------------------------
-# Pulse shapes (unchanged)
+# Dimensionless pulse shapes, with singularities tested in normalized time
 # ---------------------------------------------------------------------------
 
 def sinc_pulse(t, Tsym):
@@ -53,53 +53,35 @@ def sinc_pulse(t, Tsym):
 
 
 def rrc_pulse(t, Tsym, beta):
-    t = np.asarray(t, dtype=float)
-    eps = 1e-12
-    if abs(beta) < eps:
-        return np.sinc(t / Tsym)
+    u = np.asarray(t, dtype=float) / Tsym
+    if beta == 0:
+        return np.sinc(u)
 
-    x = np.pi * t / Tsym
-    fourbt = 4.0 * beta * t / Tsym
+    x = np.pi * u
+    fourbt = 4.0 * beta * u
     num = np.sin((1.0 - beta) * x) + fourbt * np.cos((1.0 + beta) * x)
     den = x * (1.0 - fourbt**2)
-    p = num / np.where(np.abs(den) < eps, np.inf, den)
-
-    m0 = np.abs(t) < eps
-    if np.any(m0):
-        p[m0] = 1.0 + beta * (4.0 / np.pi - 1.0)
-
-    ts = Tsym / (4.0 * beta)
-    mp = np.abs(t - ts) < 1e-9
-    mn = np.abs(t + ts) < 1e-9
-    if np.any(mp) or np.any(mn):
-        val = (beta / np.sqrt(2.0)) * (
-            (1.0 + 2.0 / np.pi) * np.sin(np.pi / (4.0 * beta)) +
-            (1.0 - 2.0 / np.pi) * np.cos(np.pi / (4.0 * beta))
-        )
-        p[mp] = val
-        p[mn] = val
-    return p
+    at_zero = np.isclose(u, 0.0, rtol=0, atol=1e-10)
+    at_pole = np.isclose(np.abs(u), 1.0 / (4.0 * beta), rtol=0, atol=1e-10)
+    p = num / np.where(at_zero | at_pole, 1.0, den)
+    pole_value = (beta / np.sqrt(2.0)) * (
+        (1.0 + 2.0 / np.pi) * np.sin(np.pi / (4.0 * beta)) +
+        (1.0 - 2.0 / np.pi) * np.cos(np.pi / (4.0 * beta))
+    )
+    return np.where(at_zero, 1.0 + beta * (4.0 / np.pi - 1.0),
+                    np.where(at_pole, pole_value, p))
 
 
 def rc_pulse(t, Tsym, beta):
-    t = np.asarray(t, dtype=float)
-    eps = 1e-12
-    if abs(beta) < eps:
-        return np.sinc(t / Tsym)
+    u = np.asarray(t, dtype=float) / Tsym
+    if beta == 0:
+        return np.sinc(u)
 
-    s = np.sinc(t / Tsym)
-    cos_term = np.cos(np.pi * beta * t / Tsym)
-    denom = 1.0 - (2.0 * beta * t / Tsym)**2
-    p = s * cos_term / np.where(np.abs(denom) < eps, np.inf, denom)
-
-    ts = Tsym / (2.0 * beta)
-    mp = np.abs(t - ts) < 1e-9
-    mn = np.abs(t + ts) < 1e-9
-    if np.any(mp) or np.any(mn):
-        val = (np.pi / (4.0 * Tsym)) * np.sinc(1.0 / (2.0 * beta))
-        p[mp] = val
-        p[mn] = val
-    return p
+    denom = 1.0 - (2.0 * beta * u)**2
+    at_pole = np.isclose(np.abs(u), 1.0 / (2.0 * beta), rtol=0, atol=1e-10)
+    p = np.sinc(u) * np.cos(np.pi * beta * u) / np.where(at_pole, 1.0, denom)
+    pole_value = (np.pi / 4.0) * np.sinc(1.0 / (2.0 * beta))
+    return np.where(at_pole, pole_value, p)
 
 
 def get_pulse_fn(pulse_type):
@@ -212,39 +194,56 @@ def main(cfg: DictConfig):
 
     # Frequency from source-of-truth metadata chain
     source_meta = calib_meta.get("source_metadata", {})
-    f_carrier = float(source_meta.get("frequency_hz", cfg.frequency))
+    f_carrier = positive_float(source_meta.get("frequency_hz", cfg.get("frequency")),
+                               "upstream frequency_hz")
+    if cfg.get("frequency") is not None:
+        configured_frequency = positive_float(cfg.frequency, "frequency")
+        if not np.isclose(configured_frequency, f_carrier, rtol=0, atol=1.0):
+            raise ValueError("frequency mismatch with calibrated paths; regenerate refinement or fix config")
     lam = speed_of_light / f_carrier
 
     # Array geometry (sanity-check against config)
     rx_array_meta = source_meta.get("rx_array", {})
-    M = int(rx_array_meta.get("num_rows", cfg.rx_array_geometry.num_rows))
-    N = int(rx_array_meta.get("num_cols", cfg.rx_array_geometry.num_cols))
-    d_h_wl = float(rx_array_meta.get("horizontal_spacing_wl",
-                                     cfg.rx_array_geometry.horizontal_spacing))
-    d_v_wl = float(rx_array_meta.get("vertical_spacing_wl",
-                                     cfg.rx_array_geometry.vertical_spacing))
+    M = positive_int(rx_array_meta.get("num_rows", cfg.rx_array_geometry.num_rows), "array rows")
+    N = positive_int(rx_array_meta.get("num_cols", cfg.rx_array_geometry.num_cols), "array columns")
+    d_h_wl = positive_float(rx_array_meta.get("horizontal_spacing_wl",
+                             cfg.rx_array_geometry.horizontal_spacing), "horizontal spacing")
+    d_v_wl = positive_float(rx_array_meta.get("vertical_spacing_wl",
+                             cfg.rx_array_geometry.vertical_spacing), "vertical spacing")
 
-    if (int(cfg.rx_array_geometry.num_rows) != M or int(cfg.rx_array_geometry.num_cols) != N):
+    if (positive_int(cfg.rx_array_geometry.num_rows, "configured rows") != M
+            or positive_int(cfg.rx_array_geometry.num_cols, "configured columns") != N):
         raise ValueError(
             f"rx_array mismatch: config {cfg.rx_array_geometry.num_rows}x"
             f"{cfg.rx_array_geometry.num_cols}, upstream {M}x{N}. "
             "Regenerate upstream data or fix the config."
         )
+    for field, actual in (("horizontal_spacing", d_h_wl), ("vertical_spacing", d_v_wl)):
+        configured = positive_float(cfg.rx_array_geometry[field], field)
+        if not np.isclose(configured, actual, rtol=0, atol=1e-12):
+            raise ValueError(f"rx_array {field} mismatch; regenerate refinement or fix config")
 
     # ---- Pulse + tap parameters ----
     pulse_type = str(cfg.channel_params.pulse.type).strip().lower()
-    pulse_Tsym = float(cfg.channel_params.pulse.Tsym)
+    pulse_Tsym = positive_float(cfg.channel_params.pulse.Tsym, "channel_params.pulse.Tsym")
     pulse_beta = float(cfg.channel_params.pulse.get("beta", 0.0))
+    if not np.isfinite(pulse_beta) or not 0 <= pulse_beta <= 1:
+        raise ValueError("channel_params.pulse.beta must be finite and in [0, 1]")
     pulse_fn = get_pulse_fn(pulse_type)
 
-    dt = float(cfg.channel_params.dt)
+    dt = positive_float(cfg.channel_params.dt, "channel_params.dt")
     include_ttd = bool(cfg.channel_params.get("include_true_time_delay", True))
     include_sp  = bool(cfg.channel_params.get("include_spatial_phase", True))
 
-    if cfg.get("training_sequence") and cfg.training_sequence.get("max_delay_bins"):
-        T_fixed = int(cfg.training_sequence.max_delay_bins)
+    # This setting defines the physical channel window. BDP generation uses
+    # the resulting saved tap count and checks that its config still agrees.
+    configured_taps = (cfg.get("training_sequence") or {}).get("max_delay_bins")
+    if configured_taps is not None:
+        T_fixed = positive_int(configured_taps, "training_sequence.max_delay_bins")
     else:
         max_delay_ns = float(cfg.channel_params.get("max_delay_ns", 500.0))
+        if not np.isfinite(max_delay_ns) or max_delay_ns < 0:
+            raise ValueError("channel_params.max_delay_ns must be finite and nonnegative")
         T_fixed = int(np.floor(max_delay_ns * 1e-9 / dt)) + 1
 
     window_ns = T_fixed * dt * 1e9
@@ -262,12 +261,34 @@ def main(cfg: DictConfig):
     rx_pos         = data["rx_pos"]                     # (R, 3)
     tx_pos         = data["tx_pos"]                     # (T, 3)
 
-    num_rx, num_tx, P_max = tau_ns_all.shape
+    if a_all.ndim != 3 or not all(a_all.shape[:2]):
+        raise ValueError("Calibrated amplitudes must have shape (RX, TX, path) with nonempty device axes")
+    num_rx, num_tx, P_max = a_all.shape
+    if (n_kept_all.shape != (num_rx, num_tx)
+            or not np.issubdtype(n_kept_all.dtype, np.integer)
+            or np.any(n_kept_all < 0) or np.any(n_kept_all > P_max)):
+        raise ValueError("Path counts must be (RX, TX) integers within the stored path axis")
+    valid = np.arange(P_max) < n_kept_all[..., None]
+    for name, value in (("a", a_all), ("tau_ns", tau_ns_all),
+                        ("omega_h", omega_h_all), ("omega_v", omega_v_all)):
+        if value.shape != a_all.shape or not np.isfinite(value[valid]).all():
+            raise ValueError(f"{name} must have shape {a_all.shape} and finite valid entries")
+    if tau_per_el_all.shape != (num_rx, num_tx, M, N, P_max):
+        raise ValueError("tau_per_element_ns shape must agree with devices, panel dimensions and paths")
+    for name, value, shape in (("min_delay_ns", min_delay_all, (num_rx, num_tx)),
+                               ("rx_pos", rx_pos, (num_rx, 3)), ("tx_pos", tx_pos, (num_tx, 3))):
+        if value.shape != shape:
+            raise ValueError(f"{name} must have shape {shape}")
+        relevant = value[n_kept_all > 0] if name == "min_delay_ns" else value
+        if not np.isfinite(relevant).all():
+            raise ValueError(f"{name} must contain finite valid values")
+    if rx_names.shape != (num_rx,) or tx_names.shape != (num_tx,):
+        raise ValueError("Device names must agree with the path tensor axes")
 
     # ---- Diagnostics only: geometric LoS delay and NLoS first-arrival excess
     # These are NOT applied to the taps (delays stay first-arrival-referenced);
-    # they are computed to set is_los_kept and to record the NLoS excess for
-    # downstream per-sample metadata / error breakdowns.
+    # they record the excess delay for downstream metadata / error breakdowns.
+    # They do not determine whether an unobstructed direct path survived.
     # tau_los_ns[r, t] = 1e9 * ||tx_pos[t] - rx_pos[r]|| / c
     dxyz = tx_pos[np.newaxis, :, :] - rx_pos[:, np.newaxis, :]   # (R, T, 3)
     d_geom = np.linalg.norm(dxyz, axis=-1)                       # (R, T) meters
@@ -278,26 +299,29 @@ def main(cfg: DictConfig):
     # is than the straight-line LoS instant (the NLoS excess for NLoS links).
     shift_ns_all = min_delay_all - tau_los_ns_all  # (R, T)
 
-    # ---- Classify links by the first-arrival-vs-LoS offset (diagnostic) ----
-    # Case A (LoS-kept): |shift| < LOS_TOL_NS. The first kept arrival ≈ LoS.
-    # Case B (NLoS-only): shift > +LOS_TOL_NS. First arrival is later than
-    #                     LoS would have been (the direct path was filtered).
-    # Case C (pathological): shift < -LOS_TOL_NS on a link that HAS paths —
-    #                        arrival earlier than straight-line geometry
-    #                        permits, which is not physical. Empty links are
-    #                        excluded: their min_delay defaults to 0, making
-    #                        shift = -tau_los spuriously negative, so counting
-    #                        them would mislabel every empty link pathological.
+    # Read the post-filter label. Older calibrated files can derive it from
+    # their surviving interactions; missing evidence must not become a guess.
     has_paths_link = n_kept_all > 0
-    is_los_kept = np.abs(shift_ns_all) < LOS_TOL_NS
-    pathological = (shift_ns_all < -LOS_TOL_NS) & has_paths_link
+    if "is_los_kept" in data.files:
+        is_los_kept = np.asarray(data["is_los_kept"])
+        if is_los_kept.shape != n_kept_all.shape or is_los_kept.dtype != np.bool_:
+            raise ValueError("is_los_kept must be a boolean (RX, TX) array")
+        if np.any(is_los_kept & ~has_paths_link):
+            raise ValueError("An empty link cannot be marked is_los_kept")
+        los_label_source = "upstream_is_los_kept"
+    else:
+        is_los_kept = los_from_interactions(
+            data["interactions"] if "interactions" in data.files else None,
+            n_kept_all)
+        los_label_source = "legacy_surviving_interactions"
+    pathological = (shift_ns_all < -DELAY_TOL_NS) & has_paths_link
     n_pathological = int(pathological.sum())
 
     # Recorded NLoS excess (diagnostic, saved as "shift_applied" for backward
     # compatibility with downstream readers): 0 for LoS-kept, pathological, and
     # empty links; the positive first-arrival-over-LoS offset for NLoS-only
     # links. This is NOT added to the taps.
-    shift_applied = shift_ns_all.copy()
+    shift_applied = np.maximum(shift_ns_all, 0.0)
     shift_applied[is_los_kept] = 0.0
     shift_applied[pathological] = 0.0
     shift_applied[~has_paths_link] = 0.0   # empty links carry no time reference
@@ -317,7 +341,7 @@ def main(cfg: DictConfig):
     has_paths = n_kept_all > 0
     n_non_empty = int(has_paths.sum())
     n_los_kept  = int((is_los_kept & has_paths).sum())
-    n_nlos_only = int((~is_los_kept & ~pathological & has_paths).sum())
+    n_nlos_only = int((~is_los_kept & has_paths).sum())
 
     print(f"\n--- LoS diagnostic ---")
     print(f"  Links with paths   : {n_non_empty} / {num_rx*num_tx}")
@@ -326,7 +350,7 @@ def main(cfg: DictConfig):
     print(f"  NLoS-only          : {n_nlos_only} "
           f"({100*n_nlos_only/max(n_non_empty,1):.1f}% of non-empty)")
     if n_pathological > 0:
-        print(f"  [WARN] pathological (shift < -{LOS_TOL_NS} ns): "
+        print(f"  [WARN] pathological (shift < -{DELAY_TOL_NS} ns): "
               f"{n_pathological} — clamped to 0.")
 
     if n_non_empty > 0:
@@ -356,7 +380,7 @@ def main(cfg: DictConfig):
                 continue
 
             # Reference delays to the earliest surviving path. The filter
-            # already min-normalized tau_ns so the first kept path sits at 0,
+            # already min-normalized tau_ns so the earliest kept path sits at 0,
             # for LoS and NLoS links alike. We deliberately do NOT rebase to
             # the geometric-LoS instant: it is computed from the (unknown at
             # inference) TX/RX positions, so baking it into the delay axis is
@@ -365,6 +389,8 @@ def main(cfg: DictConfig):
             # diagnostic but is no longer added to the taps.
             tau_ns_rel = tau_ns_all[r, t, :k]
             tpe_ns_rel = tau_per_el_all[r, t, :, :, :k]
+            if not np.isfinite(tpe_ns_rel).all():
+                raise ValueError(f"Nonfinite valid element delays at RX[{r}], TX[{t}]")
 
             # Drop paths that fall outside the tap window.
             # Delays are min-normalized (>= 0); the lower guard is defensive.
@@ -393,7 +419,10 @@ def main(cfg: DictConfig):
                 include_true_time_delay=include_ttd,
                 include_spatial_phase=include_sp,
             )
-            H_all[r, t] = H.astype(np.complex64)
+            with np.errstate(over="ignore", invalid="ignore"):
+                H_all[r, t] = H.astype(np.complex64)
+            if not np.isfinite(H_all[r, t]).all():
+                raise ValueError(f"Nonfinite channel taps at RX[{r}], TX[{t}]; check amplitudes and pulse settings")
             n_used_all[r, t] = k_in
             generated += 1
 
@@ -420,7 +449,7 @@ def main(cfg: DictConfig):
     # ---- Save ----
     out_dir = os.path.join(project_dir, "data", "channel_data")
     os.makedirs(out_dir, exist_ok=True)
-    stamp = time.strftime("%Y%m%d_%H%M%S")
+    stamp = f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}"
     out_file = os.path.join(out_dir, f"{stamp}_channels_{cfg.scenario_name}.npz")
 
     channel_meta = {
@@ -430,6 +459,11 @@ def main(cfg: DictConfig):
         "dt_s":                  dt,
         "T_fixed":               T_fixed,
         "window_ns":             window_ns,
+        "last_sample_ns":        (T_fixed - 1) * dt * 1e9,
+        "path_window_policy":    "center delay in [-dt, T_fixed*dt); pulse tails outside saved grid truncated",
+        "pulse_normalization":   "dimensionless analytic pulse; no discrete energy normalization",
+        "carrier_phase_reference": "exp(-j*2*pi*fc*tau_center_relative) times centered spatial phase",
+        "units": {"H": "sqrt(W), sampled effective channel per element", "dt_s": "s"},
         "array":                 {"M": M, "N": N,
                                   "d_h_wl": d_h_wl, "d_v_wl": d_v_wl},
         "pulse":                 {"type": pulse_type,
@@ -438,11 +472,23 @@ def main(cfg: DictConfig):
         "include_true_time_delay": include_ttd,
         "include_spatial_phase":   include_sp,
         "time_reference":          "earliest_surviving_path_per_link",
-        "los_tolerance_ns":        LOS_TOL_NS,
+        "los_classification":      LOS_CLASSIFICATION,
+        "los_label_source":        los_label_source,
+        "delay_tolerance_ns":      DELAY_TOL_NS,
         "los_kept_count":          n_los_kept,
         "nlos_only_count":         n_nlos_only,
         "pathological_count":      n_pathological,
     }
+
+    # Keep SNR diagnostics with the exact channels they describe, so BDP
+    # generation never needs an independently selected calibration file.
+    diagnostics = {}
+    for key in ("snr_raw_db", "snr_bf_db", "snr_detector_db", "p_rx_total_dbm"):
+        if key in data.files:
+            value = data[key]
+            if value.shape != (num_rx, num_tx):
+                raise ValueError(f"Invalid calibrated diagnostic shape for {key}: {value.shape}")
+            diagnostics[key] = value
 
     print(f"\nSaving to {out_file}")
     np.savez(
@@ -458,6 +504,7 @@ def main(cfg: DictConfig):
         tx_pos         = tx_pos,
         rx_look_at     = data["rx_look_at"],
         metadata       = channel_meta,
+        **diagnostics,
     )
     write_sidecar(out_file, stage="channel_taps_gen", cfg=cfg,
                   inputs={"calibrated_npz": in_file}, summary=channel_meta)

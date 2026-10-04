@@ -2,7 +2,7 @@
 
 Why this exists
 ---------------
-`data/` can be shared by several users, so multiple
+`data/` is a group-shared directory (see docs/data_layout.md), so several
 people write timestamped outputs for the same scenario into the same folders.
 Two things have to hold for that to be safe:
 

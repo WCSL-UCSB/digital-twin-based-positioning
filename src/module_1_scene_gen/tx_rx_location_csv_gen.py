@@ -33,7 +33,7 @@
 #
 # INPUTS:
 #   - Hydra config (from configs/scenarios/*.yaml)
-#   - For polygon mode: building_footprints.npz in the scene directory
+#   - For polygon modes: footprints matching the configured buffer
 #     (produced by extract_building_footprints.py)
 #   - For rooftop mode: *_rooftop.ply files in data/scenes/<loc_id>/mesh/
 #
@@ -50,7 +50,11 @@
 # =============================================================================
 
 import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+from src.utils.scene_io import resolve_scene_path, footprint_buffer_m, buffered_footprint_path
 import csv
+import glob
 import time
 import struct
 import numpy as np
@@ -104,68 +108,74 @@ def parse_base_stations(cfg):
 #  Load pre-extracted building footprints (numpy + matplotlib)
 # ─────────────────────────────────────────────────────────────
 
-def load_footprints(scene_dir):
-    """
-    Load building footprint polygons from the .npz file produced by
-    extract_building_footprints.py.
+def load_footprints(scene_dir, buffer_m=None):
+    """Load exclusion polygons, validating the requested buffer for sampling.
 
-    The .npz may carry both buffered polygons (`poly_NNNN`, used for the
-    point-in-polygon TX-exclusion test) and un-buffered raw polygons
-    (`poly_NNNN_raw`, used by the deployment image so the drawn outlines
-    match the true building footprints). If `_raw` keys are absent (older
-    .npz files), `vertices_raw` falls back to the buffered `vertices`.
+    Configured samplers always pass ``buffer_m``. Prefer the per-buffer cache;
+    a legacy scene-level file is accepted only if its metadata matches. Never
+    infer an unknown buffer or shrink a previously buffered polygon.
 
-    Returns
-    -------
-    polygons : list of dict, each with:
-        'vertices'     : (V, 2) buffered polygon (used for TX exclusion)
-        'vertices_raw' : (V, 2) un-buffered polygon (used for visualization)
-        'bbox'         : (x_min, y_min, x_max, y_max) of buffered polygon,
-                         for fast pre-filtering of the exclusion test
-        'path'         : matplotlib.path.Path on the BUFFERED polygon, for
-                         the point-in-polygon test
+    Omitting ``buffer_m`` is for plotting existing layouts: use the legacy
+    file, or a unique cache if there is no legacy file. Raw polygons are used
+    for display when available.
+
+    Returns dictionaries with vertices, vertices_raw, bbox, and a matplotlib
+    Path for the buffered exclusion polygon, all in scene-local metres.
     """
     from matplotlib.path import Path
 
-    npz_path = os.path.join(scene_dir, "building_footprints.npz")
+    legacy_path = os.path.join(scene_dir, "building_footprints.npz")
+    regenerate = (
+        "Run extract_building_footprints.py with the same scenario and buffer "
+        "before generating the TX/RX CSV."
+    )
+    if buffer_m is not None:
+        npz_path = buffered_footprint_path(scene_dir, buffer_m)
+        buffer_m = float(buffer_m)
+        if not os.path.isfile(npz_path):
+            if os.path.isfile(legacy_path):
+                npz_path = legacy_path
+            else:
+                raise FileNotFoundError(f"No footprints at {npz_path}. {regenerate}")
+    else:
+        npz_path = legacy_path
+        if not os.path.isfile(npz_path):
+            caches = sorted(glob.glob(os.path.join(
+                scene_dir, "footprints", "buffer_*m", "building_footprints.npz")))
+            if len(caches) > 1:
+                raise ValueError("Multiple footprint caches found; specify buffer_m for plotting.")
+            if not caches:
+                print(f"  No building footprints found in: {scene_dir}")
+                return []
+            npz_path = caches[0]
 
-    if not os.path.exists(npz_path):
-        print(f"  building_footprints.npz not found in: {scene_dir}")
-        print(f"  Run extract_building_footprints.py first.")
-        return []
+    with np.load(npz_path, allow_pickle=False) as data:
+        keys = set(data.files)
+        npz_buffer_m = float(data["buffer_m"][0]) if "buffer_m" in keys else None
+        if buffer_m is not None and (
+            npz_buffer_m is None or not np.isfinite(npz_buffer_m)
+            or not np.isclose(npz_buffer_m, buffer_m, rtol=0, atol=1e-9)
+        ):
+            raise ValueError(
+                f"Footprint buffer mismatch: requested {buffer_m:g} m, "
+                f"but {npz_path} records {npz_buffer_m!r} m. {regenerate}"
+            )
+        if npz_buffer_m is not None:
+            print(f"  Footprint buffer: {npz_buffer_m:g} m")
 
-    data = np.load(npz_path, allow_pickle=True)
-    keys = set(data.files)
-    num_buildings = int(data["num_buildings"][0])
-    has_raw = any(k.endswith("_raw") for k in keys)
-    npz_buffer_m = float(data["buffer_m"][0]) if "buffer_m" in keys else None
-    if npz_buffer_m is not None:
-        print(f"  .npz was written with buffer_m={npz_buffer_m:.2f} m"
-              f"{' (raw polygons also present)' if has_raw else ''}")
-
-    polygons = []
-    for i in range(num_buildings):
-        coords = data[f"poly_{i:04d}"]
-        if len(coords) < 3:
-            continue
-        xy = coords[:, :2].astype(np.float64)
-        raw_key = f"poly_{i:04d}_raw"
-        if raw_key in keys:
-            xy_raw = data[raw_key][:, :2].astype(np.float64)
-        else:
-            xy_raw = xy
-        try:
+        polygons = []
+        for i in range(int(data["num_buildings"][0])):
+            coords = data[f"poly_{i:04d}"]
+            if len(coords) < 3:
+                continue
+            xy = coords[:, :2].astype(np.float64)
+            raw_key = f"poly_{i:04d}_raw"
+            xy_raw = data[raw_key][:, :2].astype(np.float64) if raw_key in keys else xy
             path = Path(xy)
             bbox = (xy[:, 0].min(), xy[:, 1].min(),
                     xy[:, 0].max(), xy[:, 1].max())
-            polygons.append({
-                "vertices":     xy,
-                "vertices_raw": xy_raw,
-                "bbox":         bbox,
-                "path":         path,
-            })
-        except Exception:
-            continue
+            polygons.append({"vertices": xy, "vertices_raw": xy_raw,
+                             "bbox": bbox, "path": path})
 
     print(f"  Loaded {len(polygons)} building footprints from: {npz_path}")
     return polygons
@@ -347,9 +357,9 @@ def skip_ply_element(file_obj, count, properties):
                 file_obj.read(struct.calcsize(item_fmt))
 
 
-def load_rooftop_triangles(project_dir, loc_id, z_query_m):
+def load_rooftop_triangles(scene_dir, z_query_m):
     """Load rooftop footprint triangles whose roof is above the TX height."""
-    mesh_dir = os.path.join(project_dir, "data", "scenes", loc_id, "mesh")
+    mesh_dir = os.path.join(scene_dir, "mesh")
     rooftop_files = sorted(
         os.path.join(mesh_dir, name)
         for name in os.listdir(mesh_dir)
@@ -483,8 +493,47 @@ def save_deployment_image(tx_positions, polygons, output_path,
 #  Sampling strategies
 # ─────────────────────────────────────────────────────────────
 
+def load_placement_terrain(cfg):
+    """Keep existing scene-Z behavior unless terrain-relative placement is selected."""
+    reference = cfg.deployment.get("height_reference", "scene")
+    if reference == "scene":
+        return None
+    if reference != "terrain":
+        raise ValueError("deployment.height_reference must be 'scene' or 'terrain'")
+    mode = cfg.deployment.get("mode", "box")
+    if mode not in ("polygon", "box_polygon"):
+        raise ValueError("Terrain-relative placement requires polygon or box_polygon mode")
+    from src.utils.terrain import TerrainSurface
+    return TerrainSurface(resolve_scene_path(cfg), cfg.deployment.get("terrain_shape_ids"))
+
+
+def place_above_terrain(positions, terrain):
+    if terrain is None:
+        return positions
+    if not np.isfinite(positions[:, 2]).all() or (positions[:, 2] <= 0).any():
+        raise ValueError("Terrain-relative TX heights must be finite and positive")
+    ground = terrain.heights(positions[:, :2])
+    positions = positions[np.isfinite(ground)].copy()
+    positions[:, 2] += ground[np.isfinite(ground)]
+    return positions
+
+
+def sampling_batch_size(dep, remaining, tested, oversample):
+    limit = int(dep.get("max_tx_sampling_draws", int(dep.num_samples) * 100))
+    if int(dep.num_samples) <= 0 or oversample <= 0 or limit <= 0:
+        raise ValueError("Sample count, oversample_factor and draw limit must be positive")
+    if tested >= limit:
+        raise RuntimeError(
+            f"Only accepted {int(dep.num_samples) - remaining}/{dep.num_samples} TX points "
+            f"after {tested} draws; check outdoor area and terrain coverage, or "
+            "increase max_tx_sampling_draws."
+        )
+    return min(remaining * oversample, 500_000, limit - tested)
+
+
 def sample_box(cfg, rng):
     """Box-mode sampler — uniform random within bounding box."""
+    load_placement_terrain(cfg)
     box = cfg.deployment.tx_box
     N = cfg.deployment.num_samples
 
@@ -501,15 +550,19 @@ def sample_scene_polygon(cfg, rng):
     Requires extract_building_footprints.py to have been run first.
     """
     dep = cfg.deployment
+    terrain = load_placement_terrain(cfg)
     target_n = dep.num_samples
+    if target_n <= 0:
+        raise ValueError("deployment.num_samples must be positive")
     tx_z = float(dep.tx_height)
     oversample = int(dep.get("building_exclusion", {}).get(
         "oversample_factor", 4))
 
-    scene_dir = os.path.join(cfg.output_root, cfg.selected_id)
+    scene_path = resolve_scene_path(cfg)
+    scene_dir = os.path.dirname(scene_path)
 
     # ---- Load pre-extracted footprints ----
-    polygons = load_footprints(scene_dir)
+    polygons = load_footprints(scene_dir, buffer_m=footprint_buffer_m(cfg))
 
     if not polygons:
         raise FileNotFoundError(
@@ -517,26 +570,29 @@ def sample_scene_polygon(cfg, rng):
             "Run extract_building_footprints.py first to generate them."
         )
 
-    # ---- Scene bounding box from Mitsuba ----
-    scene_path = os.path.join(scene_dir, "scene.xml")
-    try:
-        from sionna.rt import load_scene
-        scene = load_scene(scene_path)
-        bbox = scene.mi_scene.bbox()
-        x_min = float(bbox.min.x)
-        x_max = float(bbox.max.x)
-        y_min = float(bbox.min.y)
-        y_max = float(bbox.max.y)
-    except Exception as e:
-        # Fallback: compute bounds from all polygon vertices
-        all_verts = np.concatenate([p["vertices"] for p in polygons], axis=0)
-        margin_x = (all_verts[:, 0].max() - all_verts[:, 0].min()) * 0.1
-        margin_y = (all_verts[:, 1].max() - all_verts[:, 1].min()) * 0.1
-        x_min = all_verts[:, 0].min() - margin_x
-        x_max = all_verts[:, 0].max() + margin_x
-        y_min = all_verts[:, 1].min() - margin_y
-        y_max = all_verts[:, 1].max() + margin_y
-        print(f"  Could not load scene.xml ({e}), using polygon bounds.")
+    if terrain is not None:
+        x_min, y_min = terrain.bounds[:, [0, 2]].min(axis=0)
+        x_max, y_max = terrain.bounds[:, [1, 3]].max(axis=0)
+    else:
+        # ---- Scene bounding box from Mitsuba ----
+        try:
+            from sionna.rt import load_scene
+            scene = load_scene(scene_path)
+            bbox = scene.mi_scene.bbox()
+            x_min = float(bbox.min.x)
+            x_max = float(bbox.max.x)
+            y_min = float(bbox.min.y)
+            y_max = float(bbox.max.y)
+        except Exception as e:
+            # Fallback: compute bounds from all polygon vertices
+            all_verts = np.concatenate([p["vertices"] for p in polygons], axis=0)
+            margin_x = (all_verts[:, 0].max() - all_verts[:, 0].min()) * 0.1
+            margin_y = (all_verts[:, 1].max() - all_verts[:, 1].min()) * 0.1
+            x_min = all_verts[:, 0].min() - margin_x
+            x_max = all_verts[:, 0].max() + margin_x
+            y_min = all_verts[:, 1].min() - margin_y
+            y_max = all_verts[:, 1].max() + margin_y
+            print(f"  Could not load {scene_path} ({e}), using polygon bounds.")
 
     print(f"  Sampling extent: X [{x_min:.1f}, {x_max:.1f}]  "
           f"Y [{y_min:.1f}, {y_max:.1f}]")
@@ -549,7 +605,7 @@ def sample_scene_polygon(cfg, rng):
 
     while len(valid_positions) < target_n:
         remaining = target_n - len(valid_positions)
-        batch_n = min(remaining * oversample, 500_000)
+        batch_n = sampling_batch_size(dep, remaining, total_tested, oversample)
 
         xs = rng.uniform(x_min, x_max, batch_n)
         ys = rng.uniform(y_min, y_max, batch_n)
@@ -561,6 +617,7 @@ def sample_scene_polygon(cfg, rng):
             ys[is_outdoor],
             np.full(int(is_outdoor.sum()), tx_z),
         ])
+        new_valid = place_above_terrain(new_valid, terrain)
         valid_positions.extend(new_valid.tolist())
 
         total_tested += batch_n
@@ -592,12 +649,15 @@ def sample_box_polygon(cfg, rng):
     """
     dep = cfg.deployment
     box = dep.tx_box
+    terrain = load_placement_terrain(cfg)
     target_n = dep.num_samples
+    if target_n <= 0:
+        raise ValueError("deployment.num_samples must be positive")
     oversample = int(dep.get("building_exclusion", {}).get(
         "oversample_factor", 4))
 
-    scene_dir = os.path.join(cfg.output_root, cfg.selected_id)
-    polygons = load_footprints(scene_dir)
+    scene_dir = os.path.dirname(resolve_scene_path(cfg))
+    polygons = load_footprints(scene_dir, buffer_m=footprint_buffer_m(cfg))
 
     if not polygons:
         raise FileNotFoundError(
@@ -616,7 +676,7 @@ def sample_box_polygon(cfg, rng):
 
     while len(valid_positions) < target_n:
         remaining = target_n - len(valid_positions)
-        batch_n = min(remaining * oversample, 500_000)
+        batch_n = sampling_batch_size(dep, remaining, total_tested, oversample)
 
         xs = rng.uniform(box.x_min, box.x_max, batch_n)
         ys = rng.uniform(box.y_min, box.y_max, batch_n)
@@ -627,6 +687,7 @@ def sample_box_polygon(cfg, rng):
         new_valid = np.column_stack([
             xs[is_outdoor], ys[is_outdoor], zs[is_outdoor],
         ])
+        new_valid = place_above_terrain(new_valid, terrain)
         valid_positions.extend(new_valid.tolist())
 
         total_tested += batch_n
@@ -648,24 +709,24 @@ def sample_box_polygon(cfg, rng):
     return positions, polygons
 
 
-def sample_scene_rooftop(cfg, rng, project_dir):
+def sample_scene_rooftop(cfg, rng):
     """
     Box-bounded sampler with rooftop exclusion via direct PLY mesh reading.
     Height-aware: only roofs above z_query_m count as exclusion zones, so
     street-level points under elevated buildings are accepted.
 
-    Reads *_rooftop.ply files from:
-        data/scenes/<loc_id>/mesh/
+    Reads *_rooftop.ply files from the resolved scene's mesh/ directory.
 
     No pre-extraction step required.
     """
+    load_placement_terrain(cfg)
     dep = cfg.deployment
-    loc_id = cfg.selected_id
+    scene_dir = os.path.dirname(resolve_scene_path(cfg))
     box = dep.tx_box
     num_samples = dep.num_samples
 
     z_query_m = float(dep.get("rooftop_mask_z_m", box.z_min))
-    rooftop_triangles = load_rooftop_triangles(project_dir, loc_id, z_query_m)
+    rooftop_triangles = load_rooftop_triangles(scene_dir, z_query_m)
     print(
         f"  Rejecting TX points inside {len(rooftop_triangles)} rooftop "
         f"triangles at z >= {z_query_m:.1f} m"
@@ -744,7 +805,7 @@ def main(cfg: DictConfig):
     elif mode == "rooftop":
         print(f"\n[rooftop mode] Generating {cfg.deployment.num_samples} "
               f"TX samples with PLY-rooftop exclusion for: {loc_id}")
-        tx_positions = sample_scene_rooftop(cfg, rng, project_dir)
+        tx_positions = sample_scene_rooftop(cfg, rng)
 
     else:
         raise ValueError(
@@ -761,8 +822,8 @@ def main(cfg: DictConfig):
     # ---- Save deployment image (modes that use footprints) ----
     if mode in ("polygon", "box_polygon"):
         if not polygons:
-            scene_dir = os.path.join(cfg.output_root, cfg.selected_id)
-            polygons = load_footprints(scene_dir)
+            scene_dir = os.path.dirname(resolve_scene_path(cfg))
+            polygons = load_footprints(scene_dir, buffer_m=footprint_buffer_m(cfg))
 
         img_path = os.path.join(output_dir, f"{loc_id}_tx_deployment.png")
         save_deployment_image(

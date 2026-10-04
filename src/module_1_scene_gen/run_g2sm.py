@@ -21,7 +21,7 @@
 # OUTPUTS:
 #   - Scene geometry files written to:
 #       <output_root>/<selected_id>/
-#     Skips generation if the output directory already exists and is non-empty.
+#     Skips existing scenes; reports incomplete nonempty directories as errors.
 #
 # CONNECTED DIRECTORIES:
 #   - configs/scenarios/       — Hydra config files (test0207.yaml, etc.)
@@ -57,19 +57,39 @@ load_dotenv()
 
 def run_scenegen_box(location_id, box, output_root,
                     enable_lidar_terrain=True, enable_dem_terrain=True,
-                    force=False):
+                    force=False, generation_settings=None):
     target_directory = os.path.join(output_root, location_id)
 
     if os.path.exists(target_directory) and os.listdir(target_directory):
-        if not force:
+        resume = bool(generation_settings and generation_settings.get("resume_incomplete", False))
+        if resume and not force and not os.path.exists(os.path.join(target_directory, "scene.xml")):
+            print(f"[Resume] Reusing source inputs for incomplete scene: {target_directory}")
+        elif not force:
+            if not os.path.isfile(os.path.join(target_directory, "scene.xml")):
+                raise RuntimeError(
+                    f"Incomplete scene directory: {target_directory}; scene.xml is missing. "
+                    "Use a new output directory or force=true to regenerate."
+                )
             print(f"[Skip] Geometry for '{location_id}' already exists in: "
                   f"{target_directory}  (set force=true to overwrite)")
             return
-        print(f"[Force] Removing existing {target_directory}")
-        shutil.rmtree(target_directory)
+        else:
+            print(f"[Force] Removing existing {target_directory}")
+            shutil.rmtree(target_directory)
 
     os.makedirs(target_directory, exist_ok=True)
     print(f"--- Generating Geometry for: {location_id} ---")
+
+    if generation_settings and generation_settings.get("lidar_building_heights", False):
+        if not (enable_lidar_terrain and enable_dem_terrain):
+            raise ValueError("The LiDAR/DEM adapter requires both terrain switches enabled")
+        # Supports both direct script execution and package imports in tests.
+        if __package__:
+            from .geo2sigmap_adapter import generate_scene
+        else:
+            from geo2sigmap_adapter import generate_scene
+        return generate_scene(box, target_directory, generation_settings,
+                              enable_lidar_terrain, enable_dem_terrain)
 
     cmd = [
         "scenegen", "bbox",
@@ -86,6 +106,8 @@ def run_scenegen_box(location_id, box, output_root,
 
     try:
         subprocess.run(cmd, cwd=target_directory, check=True, text=True)
+        if not os.path.isfile(os.path.join(target_directory, "scene.xml")):
+            raise RuntimeError("Geo2SigMap exited without producing scene.xml")
         print(f"[Success] Geometry saved to {target_directory}")
     except Exception as e:
         print(f"[Error] {e}")
@@ -117,10 +139,21 @@ def main(cfg: DictConfig):
     
     # Run generation if the geometry doesn't already exist (top-level
     # `force: true` in the scenario YAML overrides the skip).
-    run_scenegen_box(
+    details = run_scenegen_box(
         selected_id, box, output_root,
+        enable_lidar_terrain=bool(cfg.get("enable_lidar_terrain", True)),
+        enable_dem_terrain=bool(cfg.get("enable_dem_terrain", True)),
+        generation_settings=OmegaConf.to_container(cfg.scene_generation, resolve=True)
+                            if cfg.get("scene_generation") is not None else None,
         force=bool(cfg.get("force", False)),
     )
+
+    if details is not None:
+        if __package__:
+            from .scene_run_record import record_generation
+        else:
+            from scene_run_record import record_generation
+        record_generation(cfg, os.path.join(output_root, selected_id), details)
 
 if __name__ == "__main__":
     main()
