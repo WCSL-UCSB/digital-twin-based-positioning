@@ -1,0 +1,60 @@
+{
+  "data_file": "positioning-map.npz",
+  "condition": "nominal",
+  "training": "nominal",
+  "positions": 3841,
+  "training_seeds": [
+    71,
+    72,
+    73
+  ],
+  "coordinates": "Scene-local x and y in metres. Shared true test positions in identical row order.",
+  "metric": "Euclidean distance between raw predicted and true XY, in metres.",
+  "map": "Arithmetic mean of the three errors at each position. Common linear color scale from 0 to 30 m, saturated above 30 m. No interpolation.",
+  "geometry_sha256": "3769f2f1ad6648bb9bb326c2ff06aa479b4486cc21f39bb734cd216a1aa60bf9",
+  "background_file": "../assets/positioning-map-background.png",
+  "runs": [
+    {
+      "model": "early_fusion",
+      "seed": 71,
+      "model_sha256": "c06a96ff21764483507571fa3dc9d783904265184443fc9954713560d641e539",
+      "predictions_sha256": "e655663dd6e2000736414c1b307eb6bc4ca03ed1ac89ae04a212e4af8d375f72",
+      "mean_error_m": 12.93689585764768
+    },
+    {
+      "model": "early_fusion",
+      "seed": 72,
+      "model_sha256": "b79bd7ed65d062cc30abf7abd21ae1a64ee9ceccfd4a2c8aa83671c3f433be70",
+      "predictions_sha256": "5889aae1f5ede34f97e8eaa2fa63de0fa4b678bff3dc7cdbaeefcb33d9a172fa",
+      "mean_error_m": 9.745662001286862
+    },
+    {
+      "model": "early_fusion",
+      "seed": 73,
+      "model_sha256": "51f54a6c19e12a656b7155897cfa0af92d625cea9c3e90bb3507b63a042e2f6a",
+      "predictions_sha256": "0299a5e94f44acc18d652e3520f430c27172209c661575f4e5f8162bce7ee70e",
+      "mean_error_m": 10.591996615160323
+    },
+    {
+      "model": "late_fusion",
+      "seed": 71,
+      "model_sha256": "26d571cf64994d6f5cd7a36ddc5b35b8038936bc8007add6603290a81323c0ea",
+      "predictions_sha256": "328bbe31f497ac34953c968b72ed935340c4408f140e02afd0793ff3fc7b9680",
+      "mean_error_m": 6.782080437161679
+    },
+    {
+      "model": "late_fusion",
+      "seed": 72,
+      "model_sha256": "39bc6ccc65bc8eba7e10cd1a42992a8fcfc302d0e86ddfb6fc7c1b060ce97116",
+      "predictions_sha256": "66c239c4456ce185f3b7e2e8f2fc55c0833e4f7c092e8bf1ead1ca043d08e09d",
+      "mean_error_m": 4.776161689385751
+    },
+    {
+      "model": "late_fusion",
+      "seed": 73,
+      "model_sha256": "c59bdc92a99e5e544284bcda54d72daccf7811eadff76b0251bd192bb2b56aff",
+      "predictions_sha256": "1ed3c07b5552b852ebfce5a4a6e9a24326e4b67475f4b72b05714ebd3d9066e9",
+      "mean_error_m": 5.094634772322439
+    }
+  ]
+}

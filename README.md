@@ -1,35 +1,25 @@
 # Digital Twin–Based Wireless Positioning
 
-The public repository for our ongoing research in digital twin–based wireless positioning: from geographic data to simulated radio fingerprints and position estimates. Code, examples, and results are added continuously as the work progresses.
+Scene generation, radio simulation, and wireless positioning. This public repository is updated continuously as our research progresses.
 
-[Setup](docs/setup.md) · [Quickstart](docs/quickstart.md) · [Scene sources](docs/scene-sources.md) · [Repository guide](docs/structure.md)
+[Setup](docs/setup.md) · [Quickstart](docs/quickstart.md) · [Scene sources](docs/scene-sources.md)
 
-## Scene examples
+**Scenes:** Geo2SigMap, Overture height enrichment, LiDAR/DEM, BostonTwin, and Mitsuba XML.
 
-Generate scenes with Geo2SigMap/OpenStreetMap, Overture height fallback, LiDAR/DEM terrain, or BostonTwin; existing Mitsuba XML scenes are also supported.
+![Two generated New York scenes](docs/assets/nyc-scene-comparison.png)
 
-![Times Square generated with OSM and Overture heights, alongside Geo2SigMap LiDAR heights](docs/assets/nyc-scene-comparison.png)
+*New York: OSM/Overture (left), LiDAR (right). © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright). [Source credits](docs/visual-examples.md).*
 
-*Times Square, New York: the same OSM footprints and USGS terrain, with different building-height sources. Overture enriches the Geo2SigMap route. © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright), Overture Maps Foundation; USGS, NOAA, and Microsoft source data. [Figure details and credits](docs/visual-examples.md).*
+**Pipeline:** scene → ray tracing → channel responses → beam-delay fingerprints → positioning.
 
-## From scenes to positioning
+![Simulated beam-delay fingerprints](docs/assets/synthetic-fingerprints.png)
 
-**Pipeline:** scene → transmitter/receiver placement → ray tracing → path refinement and link budget → channel taps → beam-delay fingerprints → positioning.
+*Fingerprints from the runnable example. The current release includes weighted k-NN positioning.*
 
-Sionna RT simulates propagation; receiver processing turns channel responses into spatial fingerprints. The current release includes preprocessing and weighted k-NN positioning. Our ongoing work also studies CNNs that combine fingerprints from multiple base stations.
+![Positioning error maps for two CNN models](docs/assets/positioning-results.png)
 
-![Beam-delay fingerprints at three user positions in the runnable synthetic example](docs/assets/synthetic-fingerprints.png)
-
-*Example fingerprints from [the complete runnable pipeline](docs/quickstart.md); color shows a 50 dB display range.*
-
-## Example research results
-
-![Nominal positioning errors for early- and late-fusion CNNs across two training recipes and two loss weights](docs/assets/positioning-results.png)
-
-*One BostonTwin scene, 3,841 held-out positions, four base stations, and three training seeds. Points show mean error with sample standard deviation across runs. [Evaluation details and per-run metrics](docs/results.md).*
-
-These are simulation results from ongoing research. The CNN training code, weights, and study dataset are not yet included in this release.
+*Two CNN models, 3,841 test locations, three seeds. [Study details](docs/results.md). CNN code and weights are forthcoming.*
 
 **Contributors:** [Canan Cebeci](https://github.com/canancebeci) and [Josef Ullrich](https://github.com/josefullrich).
 
-**License:** [CC BY-NC 4.0](LICENSE). Third-party code and data retain their [own terms](NOTICE.md).
+**License:** [CC BY-NC 4.0](LICENSE). [Third-party terms](NOTICE.md).
