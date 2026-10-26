@@ -1,0 +1,19 @@
+defaults:
+  - base
+  - _self_
+selected_id: synthetic
+scene_xml_path: ${project_dir}/examples/synthetic/scene.xml
+deployment:
+  mode: box
+  num_samples: 64
+  base_stations:
+    - name: bs1
+      position: [-15.0, 0.0, 8.0]
+      look_at: [0.0, 0.0, 1.5]
+  tx_box:
+    x_min: -10.0
+    x_max: 10.0
+    y_min: -8.0
+    y_max: 8.0
+    z_min: 1.5
+    z_max: 1.5

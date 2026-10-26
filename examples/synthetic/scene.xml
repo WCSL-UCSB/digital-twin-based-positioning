@@ -1,0 +1,17 @@
+<!-- Synthetic geometry in metres; no external scene data required. -->
+<scene version="3.0.0">
+  <bsdf type="diffuse" id="mat-itu_concrete">
+    <rgb name="reflectance" value="0.6, 0.6, 0.6"/>
+  </bsdf>
+  <shape type="rectangle" id="ground">
+    <transform name="to_world"><scale x="30" y="30" z="1"/></transform>
+    <ref id="mat-itu_concrete"/>
+  </shape>
+  <shape type="cube" id="wall">
+    <transform name="to_world">
+      <scale x="15" y="0.2" z="4"/>
+      <translate x="0" y="12" z="4"/>
+    </transform>
+    <ref id="mat-itu_concrete"/>
+  </shape>
+</scene>

@@ -21,3 +21,9 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# Generated deployment files and local caches
+/configs/gps_coordinates/*_tx_rx.csv
+/configs/gps_coordinates/*_deployment.png
+/configs/gps_coordinates/*.bak
+/cache/

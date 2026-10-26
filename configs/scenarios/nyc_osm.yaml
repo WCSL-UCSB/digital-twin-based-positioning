@@ -1,0 +1,9 @@
+defaults:
+  - base
+  - _self_
+selected_id: nyc_osm
+enable_lidar_terrain: false
+enable_dem_terrain: false
+scene_generation:
+  height_source: osm
+  seed: 71

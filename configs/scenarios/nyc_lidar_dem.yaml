@@ -1,0 +1,14 @@
+defaults:
+  - base
+  - _self_
+selected_id: nyc_lidar_dem
+enable_lidar_terrain: true
+enable_dem_terrain: true
+scene_generation:
+  height_source: lidar
+  lidar_building_heights: true
+  seed: 71
+  ground_scale: 1.5
+  ground_material: mat-itu_medium_dry_ground
+  wall_material: mat-itu_concrete
+  rooftop_material: mat-itu_concrete

@@ -1,0 +1,6 @@
+defaults:
+  - base
+  - _self_
+selected_id: boston
+scene_generation:
+  source: bostontwin

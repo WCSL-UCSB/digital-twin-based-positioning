@@ -1,0 +1,81 @@
+# @package _global_
+project_dir: ${oc.env:PROJECT_DIR}
+gps_location_path: ${project_dir}/configs/gps_coordinates/locations.yaml
+output_root: ${project_dir}/data/scenes
+scene_xml_path: ${output_root}/${selected_id}/scene.xml
+scenario_name: ${selected_id}
+force: false
+frequency: 7.0e9
+ray_tracing_params:
+  synthetic_array: true
+  max_depth: 2
+  los: true
+  specular_reflection: true
+  diffuse_reflection: false
+  refraction: false
+  diffraction: false
+  edge_diffraction: false
+  diffraction_lit_region: true
+  samples_per_src: 10000
+  max_num_paths_per_src: 10000
+  seed: 71
+  batch_size: 16
+tx_array: &trace_array
+  num_rows: 1
+  num_cols: 1
+  horizontal_spacing: 0.5
+  vertical_spacing: 0.5
+  pattern: iso
+  polarization: V
+rx_array: *trace_array
+rx_array_geometry:
+  num_rows: 1
+  num_cols: 8
+  horizontal_spacing: 0.5
+  vertical_spacing: 0.5
+  fov_az_deg: 120.0
+  fov_el_deg: 180.0
+material_config:
+  defaults:
+    scattering_coefficient: 0.5
+  overrides: {}
+deployment:
+  mode: pending
+  base_stations: []
+link_budget:
+  tx_power_dbm: 20.0
+  tx_antenna_gain_db: 0.0
+  rx_antenna_gain_db: 0.0
+  bandwidth_hz: 100.0e6
+  noise_figure_db: 5.0
+  temperature_k: 290.0
+receiver_noise:
+  enabled: true
+  seed: 71
+channel_params:
+  dt: 1.0e-8
+  pulse: {type: sinc, Tsym: 1.0e-8, beta: 0.0}
+  include_true_time_delay: true
+  include_spatial_phase: true
+training_sequence:
+  type: zadoff_chu
+  length: 127
+  root_index: 29
+  max_delay_bins: 64
+  label_dim: 2
+  batch_size: 64
+ml_preprocessing:
+  magnitude_mode: log
+  normalization: per_sample
+  dynamic_range_db: 50.0
+  drop_uncovered: true
+training:
+  test_size: 0.2
+  val_size: 0.1
+  random_seed: 71
+  split_mode: random
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${project_dir}/outputs/hydra/${scenario_name}/${now:%Y%m%d_%H%M%S}

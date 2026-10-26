@@ -1,0 +1,14 @@
+# Bounding boxes are WGS84 degrees. Scene/device coordinates are local metres.
+nyc_osm: &nyc
+  box:
+    min_lon: -73.988155
+    min_lat: 40.756979
+    max_lon: -73.984597
+    max_lat: 40.759673
+nyc_overture: *nyc
+nyc_lidar_dem: *nyc
+boston:
+  center_lat: 42.36042393
+  center_lon: -71.06096354
+  side_m: 300.0
+synthetic: {}

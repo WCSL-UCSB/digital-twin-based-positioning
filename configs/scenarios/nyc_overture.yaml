@@ -1,0 +1,7 @@
+defaults:
+  - nyc_osm
+  - _self_
+selected_id: nyc_overture
+scene_generation:
+  height_source: overture
+  overture_release: '2026-10-21.0'
