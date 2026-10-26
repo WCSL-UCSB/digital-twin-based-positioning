@@ -15,7 +15,9 @@ src/
 examples/                 Synthetic scene and executable pipeline example
 requirements/             Dependencies for separate environments
 tests/                    Physics, input validation, routing, and geometry tests
-docs/                     Setup and usage
+docs/                     Setup, usage, visual examples, and research results
+  assets/                 Scene, fingerprint, and positioning figures
+  results/                Compact per-run metrics for published figures
 third_party/boston_twin/   Optional pinned upstream submodule
 ```
 

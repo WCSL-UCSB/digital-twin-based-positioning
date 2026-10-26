@@ -39,3 +39,4 @@ pipeline. The upstream package's license is preserved in `LICENSES/`.
   consult [USGS data policies](https://www.usgs.gov/information-policies-and-instructions).
 
 No third-party city dataset, trained weights, or generated radio map is included.
+Illustrative scene renders have additional [figure-specific source credits](docs/visual-examples.md).
